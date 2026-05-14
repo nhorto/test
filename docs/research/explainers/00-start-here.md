@@ -1,18 +1,21 @@
 # 00 — Start Here: The Big Picture and a Vocabulary Primer
 
-> **Read this first.** This is part 1 of a 5-part beginner-friendly series that re-explains the patterns from `02-multi-tenant-config-ui.md` from the ground up. Every term is defined before it's used. By the end of this doc you should have a mental model of what we're trying to build and the words to talk about it.
+> **Read this first.** This is part 1 of a beginner-friendly series that re-explains the patterns from `02-multi-tenant-config-ui.md` from the ground up, reframed for our new architecture: **a Tauri desktop app, installed on each user's machine, that talks live to the customer's database.** Every term is defined before it's used. By the end of this doc you should have a mental model of what we're trying to build and the words to talk about it.
+
+> **What changed from the old plan.** Earlier drafts assumed we'd host a web app on Cloudflare with subdomains like `acme.app.example.com` and a nightly pipeline writing JSON snapshots to edge storage. We're not doing that anymore. The new plan is: **a desktop app built with Tauri** that the customer's employees install on their own computers; the dashboard pulls fresh data from the customer's database every time you open a module. The "multi-tenant" and "config-driven UI" ideas survive — they're just achieved differently. This doc series replaces every Cloudflare-specific concept with the Tauri-equivalent and explains it from scratch.
 
 ---
 
 ## 1. What we have today
 
-You have one dashboard. It's a React app, served as static HTML+JS+CSS files from Vercel. Once a night, a pipeline (Python + a C# .NET 8 binary) runs on a Windows machine, hits the customer's database and API, and writes the results to a folder called `app/public/data/`. That folder contains 17 small JSON files — about **1.6 MB total** — and the React app reads those JSONs at runtime to render the 7 panels (Estimating, Production Control, Project Management, Time, Inspections, Purchasing, Inventory).
+You have one dashboard. It's a React app — a web app written in JavaScript that renders the UI in a browser. Today, once a night, a pipeline (Python + a C# .NET 8 binary) runs on a Windows machine, hits the customer's database and API, and writes the results to a folder called `app/public/data/`. That folder contains 17 small JSON files — about **1.6 MB total** — and the React app reads those JSONs at runtime to render the 7 panels (Estimating, Production Control, Project Management, Time, Inspections, Purchasing, Inventory).
 
 Important properties of today's setup:
 
 - **One customer.** There is no concept of "which customer is looking at this." There's just *the* dashboard.
-- **Static files.** When a user opens the app in their browser, Vercel just hands them the HTML and the JSON files. There's no server doing anything custom for them.
+- **Static files.** When a user opens the app in their browser, they get the HTML and the JSON files. There's no server doing anything custom for them.
 - **Same view for everyone.** All 7 panels and all ~80 metrics show the same way. You can't hide a panel for one customer and show it for another.
+- **Data is a day old.** Whatever the nightly pipeline wrote at 2am is what the dashboard shows all day. If something changed in the database at 9am, you won't see it until tomorrow.
 
 That's where you are. Everything below is about getting from that to where you want to be.
 
@@ -20,7 +23,7 @@ That's where you are. Everything below is about getting from that to where you w
 
 ## 2. What you want
 
-You want this exact app to serve **100–200 different fab shops**, each at their own URL — `acme.app.example.com`, `bigshop.app.example.com`, and so on. And you want to be able to say things like:
+You want this exact app to serve **100–200 different fab shops**, each running their own copy on their own computers. And you want to be able to say things like:
 
 - "Acme doesn't pay for Inspections — hide that whole panel for them."
 - "BigShop wants to see the *Monthly Hours* metric instead of *Weekly Hours* in the Time panel — swap it for them."
@@ -28,46 +31,62 @@ You want this exact app to serve **100–200 different fab shops**, each at thei
 
 …**without writing a separate copy of the app for each customer.** That's the dream. One codebase, many customers, each seeing their own customized version.
 
-That dream has two halves, and they're easier to understand if you separate them:
+You also want **live data**. When someone opens the Time panel, they should see the *current* numbers from the database, not last night's snapshot. No more 24-hour delay.
 
-**Half 1 — Multi-tenancy:** how do you make ONE deployed app serve MANY customers, with each customer's data kept separate and each customer routed to "their" version?
+And — because every employee at a fab shop is going to install this on their own laptop — you want **one installer** that any of those 100–200 fab shops can run, and the app should "know" which fab shop it belongs to without you building a custom installer per customer.
+
+That dream has three halves (yes, three halves — language is hard), and they're easier to understand if you separate them:
+
+**Half 1 — Multi-tenancy on the desktop:** how do you make ONE installer serve MANY customers, with each install knowing which customer it's for and seeing only that customer's data?
 
 **Half 2 — Config-driven UI:** how do you customize WHAT each customer sees without writing custom code per customer?
 
-The whole rest of this docs series is about those two things. Part 1 (this doc) gives you the vocabulary. Parts 2–5 build the actual machinery.
+**Half 3 — Live data instead of nightly snapshots:** how does the desktop app reach the customer's database from each employee's laptop, safely?
+
+The whole rest of this docs series is about those three things. Part 1 (this doc) gives you the vocabulary. The numbered docs after this build the actual machinery.
 
 ---
 
-## 3. What "multi-tenancy" actually means
+## 3. What "multi-tenancy" actually means (in a desktop world)
 
 A **tenant** is SaaS-speak for "one of your customers." It comes from the apartment building analogy: one building (your app), many tenants (your customers), each in their own apartment (their data and view).
 
-**Multi-tenancy** = your app is built so that *one running instance* of it serves *many tenants at once*, with each tenant's data and view kept walled off from the others.
+**Multi-tenancy** traditionally means: your app is built so that *one running instance* of it serves *many tenants at once*, each kept walled off from the others. That's the web version. In a *desktop* world it's a little different. Every customer has their own installs of the same app, but it's still the same binary, the same codebase, the same updates — and the app figures out, at runtime, which customer it's for and behaves accordingly.
 
-The opposite is called **single-tenancy**: one running instance per customer. If you had 200 customers and a single-tenant model, you'd be running 200 separate copies of the app, each on its own server. Possible, but expensive and painful to update.
+So "multi-tenant desktop app" in our case means three things at once:
+
+1. **One codebase.** We write the app once. There is not an `acme` branch and a `bigshop` branch.
+2. **One installer.** We ship a single `.msi` (Windows) / `.dmg` (Mac) / `.AppImage` (Linux). The same installer goes to every fab shop.
+3. **Per-tenant behavior at runtime.** The app, once installed, asks "who am I for?" and then loads that tenant's config — which determines which panels show, which metrics show, and where to fetch the data from.
+
+The opposite of all this is called **single-tenancy**: write a custom build per customer. Possible, but painful — 200 customers means 200 builds to maintain. We're avoiding that.
 
 Here's the picture:
 
 ```
-SINGLE-TENANT (don't do this for 200 customers):
-┌──────────┐  ┌──────────┐  ┌──────────┐         ┌──────────┐
-│ App copy │  │ App copy │  │ App copy │  ...    │ App copy │
-│ for Acme │  │ for Bob's│  │ for Cora │         │ for Zeta │
-└──────────┘  └──────────┘  └──────────┘         └──────────┘
-   Acme        Bob's          Cora                Zeta
+SINGLE-TENANT DESKTOP (don't do this for 200 customers):
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│ acme-installer.msi  │  │ bigshop-installer   │  │ cora-installer.msi  │   ...
+│ (custom build)      │  │ (custom build)      │  │ (custom build)      │
+└─────────────────────┘  └─────────────────────┘  └─────────────────────┘
 
-MULTI-TENANT (one app, many customers):
-                    ┌──────────────────┐
-                    │   ONE app, ONE   │
-                    │  deployment      │
-                    └──────────────────┘
+MULTI-TENANT DESKTOP (one app, many customers):
+                    ┌──────────────────────┐
+                    │  dashboard-x.y.z.msi │
+                    │  (one installer for  │
+                    │  everyone)           │
+                    └──────────────────────┘
+                                ↓ installed by employees at...
                   ↗     ↑      ↑       ↖
-              Acme   Bob's   Cora   ...  Zeta
+              Acme   BigShop   Cora   ...  Zeta
+                  ↑      ↑      ↑          ↑
+              (each install carries a license key
+               that tells it which tenant it's for)
 ```
 
 The key skill of multi-tenancy is: **whenever the app does anything, it knows which tenant it's doing it for.** Read data? Read Acme's data, not everyone's. Render the dashboard? Render Acme's modules, not the default. Save settings? Save them under Acme.
 
-That "knowing which tenant" thing is called **tenant resolution**, and it's covered in the next doc (`01-tenant-resolution.md`).
+That "knowing which tenant" thing is called **tenant resolution**, and on the web it's done by reading the URL subdomain. On the desktop, there's no URL — so we do it with a **license key** that the user enters on first launch. It's covered in detail in the next doc (`01-tenant-resolution.md`).
 
 ---
 
@@ -89,20 +108,17 @@ WITHOUT config-driven UI (the bad way for 200 customers):
     render <Time withMonthlyHoursInsteadOfWeekly />
     ...
   }
-  else if (tenant === 'bob's-beams') {
+  else if (tenant === 'bigshop') {
     render <Estimating withExtraTile />
     render <ProductionControl />
     render <Inspections />
-    ...
-  }
-  else if (tenant === 'cora-construction') {
     ...
   }
   // 200 of these. Maintain forever. Cry.
 
 WITH config-driven UI (the way we're going):
 
-  const config = loadConfigFor(tenant);  // a JSON file specific to this tenant
+  const config = loadConfigForThisTenant();  // a JSON file specific to this tenant
   for (const moduleName of config.enabledModules) {
     for (const metric of resolveMetrics(moduleName, config)) {
       render <MetricSlot id={metric} />
@@ -113,37 +129,66 @@ WITH config-driven UI (the way we're going):
 
 A config-driven UI moves the *what shows* decisions out of code and into a per-tenant JSON file. To customize Acme, you don't change React code — you change `acme.json`.
 
-The thing that makes this possible is called the **registry pattern**, which is in doc `03-registry-pattern.md`. That's where the most confusion was in the original doc, so we'll spend the most time on that one.
+In the desktop world, where does this JSON come from? Two options, both fine, and we'll cover both:
+
+- **Shipped with the app.** The codebase contains a `tenants/` folder with `acme.json`, `bigshop.json`, etc. When the app runs, it looks up "I'm Acme" → loads `tenants/acme.json` from inside its own bundle.
+- **Fetched at startup.** The app phones home to a small server we run, says "I'm Acme, give me my config," and gets back JSON. Slightly more flexible (you can change a config without shipping an update) but adds a server dependency.
+
+We'll start with "shipped with the app" because it's simpler and works offline. Doc 02 explains when and how to migrate.
+
+The thing that makes any of this possible — the trick that lets the React code render different metrics for different tenants without an `if` ladder — is called the **registry pattern**, which is in doc `03-registry-pattern.md`. That's where the most confusion was in the original doc, so we'll spend the most time on that one.
 
 ---
 
 ## 5. The vocabulary primer
 
-Here's every weird term in the original doc, defined in plain English. Skim now, refer back as you read the other docs.
+Here's every weird term you'll see in the rest of these docs, defined in plain English. Skim now, refer back as you read the other docs.
 
-### Tenancy / hosting
+### Desktop / Tauri
 
-- **Tenant** — one customer. "Acme" is a tenant. "Bob's Beams" is a tenant. We talk about *the tenant* the way you might talk about *the user* in a normal app, except a tenant is usually a company that has many users inside it.
+- **Tauri** — a framework for building desktop apps using web technology (HTML, CSS, JavaScript/TypeScript) for the UI, and Rust for the "native" stuff (file access, OS-level features, talking to the operating system). Think of it as: "take my React app, wrap it in a real desktop window, give it the ability to read local files and call the OS." It's like Electron, but uses the operating system's built-in browser engine instead of bundling Chromium — which makes the installer **tiny** (a few MB instead of 80+ MB).
+
+- **Webview** — the native browser engine that displays the UI inside a desktop app. On Windows it's WebView2 (Microsoft Edge's engine, comes pre-installed on Windows 10/11). On Mac it's WKWebView (Safari's engine). On Linux it's WebKitGTK. From your perspective, the webview is "the thing that runs the React app inside the desktop window."
+
+- **Rust** — a programming language. You don't need to learn it deeply. Tauri's "native" side (the part that's not React) is written in Rust. We will write a small amount of Rust to handle things like reading the license key, calling the data gateway, and exposing those capabilities to the React UI.
+
+- **Tauri command** — a Rust function the React UI can call. Example: from React, `await invoke('get_tenant_id')` calls a Rust function named `get_tenant_id`, which returns whatever it wants. This is how the UI safely asks the native side to do things it can't do on its own (read files, make HTTP requests to authenticated endpoints, etc.).
+
+- **Sidecar** — a separate program that Tauri ships alongside the main app and can start, stop, and talk to. Example: if we keep the C# .NET binary, Tauri can launch it as a sidecar and call into it. Or a Python script. Or anything. Tauri just spawns the process and pipes commands and data in and out.
+
+- **Installer** — the `.msi` file (Windows), `.dmg` file (Mac), or `.AppImage`/`.deb`/`.rpm` (Linux) that the user double-clicks to install your app. Tauri builds one per target platform.
+
+- **Code signing** — a cryptographic stamp on your installer that proves it came from you and hasn't been tampered with. Without it, Windows pops up a scary "this app is from an unknown publisher" warning, and Mac flat-out refuses to run it. You buy a "code signing certificate" (Windows: ~$200/year; Mac: $99/year as part of Apple Developer Program) and use it during the build. Covered in doc 12.
+
+- **Auto-updater** — a Tauri feature that, on launch, checks "is there a newer version available?" and if so downloads and installs it (the user gets a "restart to update" prompt). The new version is hosted on a small static endpoint we run. Means you don't have to ask every user to manually re-download installers when you ship a new version.
+
+### Tenants and identity
+
+- **Tenant** — one customer. "Acme" is a tenant. "BigShop" is a tenant. We talk about *the tenant* the way you might talk about *the user* in a normal app, except a tenant is usually a company that has many users inside it.
 
 - **Multi-tenant** — one app, many tenants. The opposite of single-tenant.
 
-- **Subdomain** — the part before your main domain. In `acme.app.example.com`, the subdomain is `acme`. The "main domain" is `app.example.com`. The browser sends the full host (`acme.app.example.com`) to the server in every request, so we can read it and figure out which tenant.
+- **Tenant slug** — a short, lowercase, no-spaces identifier for a tenant. "acme" not "Acme Corporation". Used as a key everywhere: filenames (`tenants/acme.json`), in the license key, in log lines. Like a username for a company.
 
-- **Wildcard subdomain** — DNS configuration that says "anything matching `*.app.example.com` should route here." Means we don't have to add a DNS record per tenant; we add one wildcard and it handles all of them.
+- **License key** — a long string the user enters on first launch that proves they're allowed to use the app and tells the app *which tenant they are*. Looks like `ACME-J5N7-8K2P-Q4F9-X1Z3` or, more technically, a **JWT** (see below). The license key is the thing that makes "one installer, many customers" work.
 
-- **Cloudflare Pages** — Cloudflare's product for hosting static frontends like Vite/React/Vue/Next. Like Vercel, but on Cloudflare. Free up to a generous quota.
+- **JWT** (JSON Web Token) — a format for a signed message. It looks like a long random string but it's actually three base64-encoded chunks separated by dots: `header.payload.signature`. The payload is plain JSON (e.g., `{"tenant": "acme", "expires": "2027-01-01"}`). The signature proves we issued it. The app verifies the signature with a public key baked into the build. If the signature is bad → reject. If it's good → trust the payload. Doc 01 walks through this.
 
-- **Cloudflare Worker** — a small bit of JavaScript or TypeScript that runs *at the edge*. ("Edge" = on Cloudflare's network, near the user, not on a server in some specific region.) When a user requests a URL, you can intercept the request with a Worker, do something (read a header, look up a config, transform the response), and either pass it through or respond yourself. We're going to use a Worker to figure out which tenant a request is for and inject their config.
+- **Public key / private key** — a pair of cryptographic keys that work together. We keep the private key secret (it lives on one machine you control). We bake the public key into the app's source code. The private key *signs* license keys; the public key *verifies* them. Anyone with the public key can verify, but only someone with the private key can sign. This is how we issue license keys offline without needing a server.
 
-- **The edge** — short for "edge of the network." When a user in Texas requests your app, it hits a Cloudflare data center in Texas (not your origin server in Virginia or wherever). Workers run in those edge data centers — that's why they're fast.
+- **Activation** — the first-launch flow where the user pastes their license key, the app verifies it, extracts the tenant slug, loads that tenant's config, and writes everything to a local file so it doesn't have to ask again next launch.
 
-- **Cloudflare KV** — a tiny database designed to live at the edge. Think of it as a giant key-value store: `KV.get('tenants:acme')` returns whatever JSON you stored under that key. Reads are very fast. Writes are slow and *eventually consistent* (more on that below).
+### Data (live, not nightly)
 
-- **Eventually consistent** — when you write to KV, the new value isn't visible *everywhere* immediately. It takes up to ~60 seconds to propagate to every Cloudflare edge location. For "tenant config that rarely changes," this is fine. For "user just added a comment, refresh the page" it's bad. Different tools for different jobs.
+- **Live data** — the new model. Every time a module loads, the app makes a fresh HTTP call to fetch the latest numbers from the customer's database. Compare to the old model: "read a JSON file the pipeline wrote last night."
 
-- **Cloudflare D1** — a real SQL database (SQLite under the hood) that lives at the edge. Stronger consistency than KV (writes are visible immediately on the next read). Slower per-query than KV but you can run real SQL like `SELECT * WHERE x = ?`. Use D1 when you need queries; use KV when you just need fast key lookups.
+- **Customer database** — the database that holds the customer's actual business data. Most of our customers run an ERP system (something like a manufacturing-shop accounting/inventory system) on a Windows server in their office. The database is usually SQL Server or similar. They run it, not us; we just read from it.
 
-- **Cloudflare R2** — Cloudflare's object storage. Like Amazon S3 but cheaper to read out of. You upload a file, you get a URL, you can download it. We'll use R2 to store the per-tenant JSON snapshots that the nightly pipeline produces.
+- **Data gateway** — a small program that runs on **one machine inside the customer's network**, holds the database credentials, knows how to query the customer's database, and exposes some HTTP endpoints like `GET /metrics/estimating/win-rate`. All the employee desktop apps in the fab shop call the gateway; the gateway calls the database. We do this because we don't want database passwords on every employee's laptop. The gateway is also where the C# .NET binary (or its Python replacement) lives — it's the "smart" piece that knows how to compute each metric.
+
+- **ERP** — Enterprise Resource Planning. A category of business software. Manufacturing shops use ERPs to track jobs, parts, time, purchasing, etc. The ERP usually has a database underneath it. Our app reads from that database (via the gateway) to compute the metrics. We don't write to the ERP — we just read.
+
+- **Localhost** — the machine you're sitting at. The address `http://localhost:8080` means "talk to a program running on this same machine, on port 8080." On the desktop, the React app inside Tauri often talks to a service on localhost (when developing). In production, it'll talk to the gateway at the gateway's address on the LAN (e.g., `http://gateway.acme.local:8080` or `http://192.168.1.50:8080`).
 
 ### React / TypeScript
 
@@ -164,11 +209,11 @@ Here's every weird term in the original doc, defined in plain English. Skim now,
 
   Then if your config says "show metric `estimating.win-rate`" you can do `METRICS['estimating.win-rate']` and get the component. The registry pattern is the heart of config-driven UI, and we'll cover it in detail in doc 03.
 
-- **Lazy loading** — loading code only when it's actually needed. By default, when a user opens your app, the browser downloads ALL the JavaScript in one big file. Lazy loading splits it: the browser only downloads the JS for the Time panel when the user opens the Time panel. Saves bandwidth and makes the initial load faster.
+- **Lazy loading** — loading code only when it's actually needed. By default, when a user opens your app, the webview loads ALL the JavaScript in one big file. Lazy loading splits it: the webview only loads the JS for the Time panel when the user opens the Time panel. Less to read off disk, faster startup.
 
 - **Code splitting** — basically a synonym for lazy loading. The build tool (Vite) splits your one big JS file into smaller "chunks" that can be loaded on demand.
 
-- **`React.lazy`** — React's built-in API for lazy loading a component. Looks like: `const Time = React.lazy(() => import('./Time'))`. This says "don't bundle Time with the main app; download it the first time we render `<Time />`."
+- **`React.lazy`** — React's built-in API for lazy loading a component. Looks like: `const Time = React.lazy(() => import('./Time'))`. This says "don't bundle Time with the main app; load it the first time we render `<Time />`."
 
 - **Suspense** — React's tool for showing a fallback (like a spinner) while a lazy component is loading. Wrap a `<React.lazy>` component in `<Suspense fallback={<Spinner />}>` and React handles "show spinner, then swap to the real thing when it's loaded."
 
@@ -201,69 +246,98 @@ If those don't sink in yet, that's totally fine. We'll work through them with ex
 
 ## 6. The whole picture, end to end
 
-Here's what we're building. Imagine a user at Acme types `acme.app.example.com` into their browser. Here's everything that happens:
+Here's what we're building. Imagine an employee at Acme just got the installer link from their IT person. Let's walk through every step from "download" to "live dashboard."
 
 ```
-   ┌──────────────┐
-   │  User at Acme│
-   │              │
-   │  Browser →   │  https://acme.app.example.com
-   └──────┬───────┘
-          │
-          │ 1. DNS lookup says "*.app.example.com lives at Cloudflare"
-          ▼
    ┌──────────────────────────────────────────────────┐
-   │              CLOUDFLARE EDGE                     │
+   │  STEP 1 — First-time install                     │
    │                                                  │
-   │  2. Cloudflare receives the request.             │
-   │     A "Worker" we deployed runs first.           │
+   │  Employee downloads dashboard-1.2.3.msi from     │
+   │  our update server (the same .msi everyone uses).│
+   │  Double-clicks it. Tauri installs the app.       │
+   └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+   ┌──────────────────────────────────────────────────┐
+   │  STEP 2 — First launch / activation              │
+   │                                                  │
+   │  App opens to an "Enter your license key" screen.│
+   │  Employee pastes: ACME-J5N7-8K2P-Q4F9-X1Z3       │
+   │  (which IT sent them, originally issued by us).  │
    │                                                  │
    │  ┌────────────────────────────────────────────┐  │
-   │  │ Worker code (TypeScript):                  │  │
-   │  │  - Read the host: "acme.app.example.com"   │  │
-   │  │  - Extract the slug: "acme"                │  │
-   │  │  - Look up "tenants:acme" in KV            │  │
-   │  │     → returns acme's config JSON           │  │
-   │  │  - Fetch index.html from Pages             │  │
-   │  │  - Inject the config into the HTML as      │  │
-   │  │    <script id="__tenant__"                 │  │
-   │  │            type="application/json">…</…>   │  │
-   │  │  - Return the modified HTML                │  │
+   │  │ Rust side (Tauri command verify_license):  │  │
+   │  │  - Decode the JWT                          │  │
+   │  │  - Verify signature with baked-in public   │  │
+   │  │    key                                     │  │
+   │  │  - Extract payload: { tenant: "acme",      │  │
+   │  │      gateway_url: "http://10.0.5.20:8080" }│  │
+   │  │  - Save license + tenant slug to a local   │  │
+   │  │    config file under the OS app-data       │  │
+   │  │    directory.                              │  │
    │  └────────────────────────────────────────────┘  │
-   │                                                  │
-   │  3. Cloudflare Pages serves the React app's      │
-   │     static files (HTML, JS, CSS) — including     │
-   │     the Worker-modified HTML from step 2.        │
    └──────────────────────────────────────────────────┘
-          │
-          │ 4. Browser receives HTML with config baked in
-          ▼
+                            │
+                            ▼
    ┌──────────────────────────────────────────────────┐
-   │              USER'S BROWSER                      │
+   │  STEP 3 — Load the tenant config                 │
    │                                                  │
-   │  5. React app boots.                             │
-   │     - Reads the embedded <script> tag            │
-   │     - Parses the JSON → that's Acme's config     │
-   │     - Looks at config.enabledModules             │
-   │     - For each enabled module:                   │
-   │        - Loads the module's code (lazy chunk)    │
-   │        - Computes the list of metrics to show    │
-   │          (defaults + overrides from config)      │
-   │        - For each metric, renders <MetricSlot>   │
-   │     - <MetricSlot> looks up the component in     │
-   │       the registry by ID and renders it.         │
+   │  Rust reads `tenants/acme.json` from inside the  │
+   │  app bundle. (Or, optionally, fetches it from a  │
+   │  server.) Hands it to the React UI.              │
    │                                                  │
-   │  6. Each metric component fetches its data:      │
-   │     - GET /tenants/acme/data/estimating.json     │
-   │       (served from R2 via Worker, or from        │
-   │        Pages if we keep static)                  │
-   │     - Renders the chart/table/whatever           │
+   │  Acme's config (simplified) says:                │
+   │   {                                              │
+   │     "enabledModules": ["estimating",             │
+   │                        "production-control",     │
+   │                        "time", "purchasing"],    │
+   │     "metricOverrides": { ... }                   │
+   │   }                                              │
+   └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+   ┌──────────────────────────────────────────────────┐
+   │  STEP 4 — Render the dashboard                   │
    │                                                  │
-   │  7. User sees Acme's customized dashboard.       │
+   │  React app boots inside Tauri's webview.         │
+   │   - For each module in config.enabledModules:    │
+   │      - Lazy-load that module's code              │
+   │      - Compute the metrics to show (defaults +   │
+   │        overrides from config)                    │
+   │      - For each metric, render <MetricSlot>      │
+   │   - <MetricSlot> looks up the component in the   │
+   │     registry by ID and renders it.               │
+   └──────────────────────────────────────────────────┘
+                            │
+                            ▼
+   ┌──────────────────────────────────────────────────┐
+   │  STEP 5 — Live data fetch (per metric)           │
+   │                                                  │
+   │  Each metric component fetches its own data:     │
+   │                                                  │
+   │   React: await invoke('fetch_metric',            │
+   │           { id: 'estimating.win-rate' })         │
+   │                                                  │
+   │   Rust:  HTTP GET                                │
+   │           http://10.0.5.20:8080/metrics/         │
+   │           estimating/win-rate                    │
+   │                                                  │
+   │   Gateway: queries Acme's database, runs the     │
+   │           computation, returns JSON.             │
+   │                                                  │
+   │   Rust → React → renders the number. Done.       │
    └──────────────────────────────────────────────────┘
 ```
 
-Re-read the diagram now that you have the vocabulary. Steps 2–3 are "tenant resolution" (doc 01). Steps 4–5 are "config-driven UI" (docs 02 + 03). Step 6 is data fetch and is the same as today, just per-tenant.
+A few things worth highlighting in that diagram:
+
+- **There is no "our server" in the request path for data.** Every data fetch goes from the employee's laptop to a gateway running inside Acme's own network. We don't see their data. We don't hold their database password. (This is good for compliance and for them trusting us.)
+
+- **The license key is the one place we centrally control anything.** It's signed by us, and it carries the tenant slug and the gateway URL. If we revoke a customer (they stop paying), we don't have to flip a switch — their existing key keeps working until expiry, and they can't install new copies because no new keys.
+
+- **Updates flow through us.** When we ship a new version of the app, the auto-updater downloads it from our update server. The update server is small — it just hosts signed binaries. It does NOT see customer data; it only ever sees "give me the latest installer."
+
+Re-read the diagram now that you have the vocabulary. Step 2 is "tenant resolution" (doc 01). Steps 3–4 are "config-driven UI" (docs 02 + 03). Step 5 is "live data fetch" (doc 09), and the gateway it talks to is the subject of docs 06 and 07.
 
 ---
 
@@ -271,13 +345,17 @@ Re-read the diagram now that you have the vocabulary. Steps 2–3 are "tenant re
 
 A few obvious-sounding alternatives, and why they're worse:
 
-- **"Just check the URL inside React and decide what to show."** You'd skip the Worker. Problem: an unknown tenant (`hacker.app.example.com`) would still get the full app shell loaded, just with nothing to render. Tiny security/UX issue, but a real one. With the Worker pattern, an unknown tenant gets a clean 404 before any code is shipped to the browser.
+- **"Just build a separate installer per tenant."** That's single-tenant. We have to compile, sign, and ship a different binary per customer. New release = 200 builds. New customer = a build before they can install. We avoid all of that by making the same installer ask "who am I?" at runtime via the license key.
 
-- **"Build a separate copy of the app per tenant."** That's single-tenant. We covered why it doesn't scale.
+- **"Just check a config file inside React and decide what to show."** You could put `tenant.json` next to the app and have React read it. Fine for one or two tenants, but then anyone can edit `tenant.json` on their laptop and pretend to be a different tenant. The license-key + signature pattern stops that: the *signed* token proves the tenant, and only we can sign one.
 
-- **"Put all the configurability in a database, no JSON in the repo."** Tempting, but at 5–10 tenants, hand-editing JSON in a Git PR is faster and gives you free version control. We'll graduate to KV at ~50 tenants. Doc 02 explains the migration path.
+- **"Put DB credentials directly in the desktop app."** Tempting because then you skip the gateway. Don't do it. If 30 employees at Acme have the app, that's 30 copies of Acme's database password sitting on 30 laptops. One stolen laptop = compromised credentials. The gateway holds creds in *one* place, and the laptops only get to call HTTP endpoints — they never see the database directly.
 
-- **"Make every layout decision a config option."** The trap. Adding `branding`, `colors`, `roles`, `layout grid` to config quadruples your testing surface for benefits zero customers asked for. The principle: **you only make X configurable when at least 3 tenants actually need different X.** Until then, it's hardcoded. Doc 04's anti-patterns section goes deeper.
+- **"Run a cloud gateway we host for all customers."** Means each customer's database has to be reachable from the public internet, or via VPN/tunnel back to us. Most fab shops won't open that hole. A local gateway inside *their* network has none of that problem.
+
+- **"Keep the nightly pipeline; just port it to write to each tenant's machine."** You can, but then everything is still 24 hours stale, and you're managing a big pipeline that you mostly don't need. Live fetch from the gateway is simpler operationally for small data volumes (which is what dashboards are).
+
+- **"Make every layout decision a config option."** The classic trap. Adding `branding`, `colors`, `roles`, `layout grid` to config quadruples your testing surface for benefits zero customers asked for. The principle: **you only make X configurable when at least 3 tenants actually need different X.** Until then, it's hardcoded. Doc 04's anti-patterns section goes deeper.
 
 ---
 
@@ -286,18 +364,28 @@ A few obvious-sounding alternatives, and why they're worse:
 | Doc | What it explains |
 |---|---|
 | **00 (this doc)** | Big picture + vocabulary. You're here. |
-| **01 — Tenant resolution** | How `acme.app.example.com` becomes "I am serving Acme." Worker code line by line. Local dev (since `localhost` has no subdomain). |
-| **02 — Config: schema and storage** | What's in a tenant config. What Zod is and why it's there. Where the configs live (JSON file? KV? D1? R2? — explained one by one in plain English). Schema versioning. |
+| **01 — Tenant resolution** | How the app figures out "I am for Acme." License keys, JWTs, signing, first-launch activation, and what happens if the user enters a bad/expired key. |
+| **02 — Config: schema and storage** | What's in a tenant config. What Zod is and why it's there. Where the configs live (shipped with the app vs. fetched from a server, when to graduate). Schema versioning. |
 | **03 — The registry pattern** | The big one. The pattern that makes config-driven UI work. Modules registry, metric registry, every TypeScript trick (`as const`, `satisfies`, derived unions) explained with examples. The `<MetricSlot>` component walked through line by line. Lazy loading and Suspense. |
-| **04 — Flags, anti-patterns, full walkthrough** | When config and when feature flag. The 10 anti-patterns to avoid, each in plain language. Then a complete worked example: take Acme's config and trace exactly what renders, with every line of code annotated. |
+| **04 — Flags, anti-patterns, full walkthrough** | When config and when feature flag. The 10 anti-patterns to avoid, each in plain language. Then a complete worked example: take Acme's config and trace exactly what renders. |
+| **05 — Tauri architecture** | Tauri's parts (webview, Rust backend, sidecars), how the React UI talks to Rust, the gateway design with tradeoffs (direct DB / local gateway / cloud gateway), where each piece lives, and how data flows end to end. |
+| **06 — Customer data: how it gets in (live)** | The customer's database, the ERP shape, what credentials look like, how the gateway connects, and what "live fetch" means in practice. |
+| **07 — The pipeline (and why it goes away)** | What the old nightly pipeline did, why we're killing it, where its logic moves to in the new world, and a careful discussion of what to do with the C# .NET binary (rewrite in Python? keep as a Tauri or gateway sidecar? rewrite in Rust? pros and cons). |
+| **08 — Data isolation** | In the new world, each install is single-tenant, so most cross-tenant leak risks disappear. But not all. We cover what *can* still leak (license keys, gateway URLs, cached data) and how to prevent it. |
+| **09 — Data fetching** | The data fetch path from React → Tauri command → Rust HTTP client → gateway → database → back. Caching, retries, offline behavior, and what to show in the UI while waiting. |
+| **10 — Auth** | How license keys authenticate "this install belongs to this tenant," and (optional) how to add per-user auth on top for individual employees. |
+| **11 — Tenant lifecycle** | Onboarding a new fab shop: issuing their license key, deploying their gateway, shipping them their config. Updating an existing tenant. Offboarding. |
+| **12 — Local dev and deploy** | How to run Tauri in dev mode. Building installers for Windows/Mac/Linux. Code signing (the painful part). Distributing installers. Setting up the auto-updater. |
+| **13 — CI/CD** | Automated builds for the three OSes, signing in CI, publishing update manifests. |
+| **14 — Observability and cost** | What you actually pay for in the new world (mostly: signing certs, update hosting). How to know if a deployed app is failing without seeing customer data. Error reporting patterns. |
 
 ---
 
 ## 9. How to read these docs
 
-Read in order: 00 → 01 → 02 → 03 → 04. They build on each other. Doc 03 will be confusing if you skipped 02 because we'll be referring to the config schema we defined there.
+Read in order: 00 → 01 → 02 → 03 → 04 → 05 → … They build on each other. Doc 03 will be confusing if you skipped 02 because we'll be referring to the config schema we defined there. Doc 09 references the gateway from doc 05.
 
-Each doc starts with a "what you'll know by the end" summary. If you find yourself thinking "wait, what's a Worker?" — flip back here to §5 vocabulary. Don't push through confusion; the docs aren't going anywhere.
+Each doc starts with a "what you'll know by the end" summary. If you find yourself thinking "wait, what's a webview?" — flip back here to §5 vocabulary. Don't push through confusion; the docs aren't going anywhere.
 
 If something is still unclear after reading slowly, that's a signal to me that the doc isn't beginner-friendly enough — flag it and I'll rewrite that section.
 
@@ -305,19 +393,21 @@ If something is still unclear after reading slowly, that's a signal to me that t
 
 ## 10. By the end of this doc you should know
 
-- What a **tenant** is and what **multi-tenancy** means.
-- What a **subdomain** is and why we use one per tenant.
-- What a **Cloudflare Worker** is and where it sits in the request flow.
-- The difference between **KV**, **D1**, and **R2** at a high level.
+- What a **tenant** is and what **multi-tenancy on the desktop** means.
+- Why we're using **Tauri** (small installer, real native app, can talk to local services and the OS).
+- What a **webview** is and where it fits.
+- What a **license key** is and why it's how we identify the tenant on the desktop.
+- What **live data** means and why we're killing the nightly pipeline.
+- What a **data gateway** is and why it sits inside the customer's network.
 - What **module** and **metric** mean in our app.
 - What a **registry** is, conceptually (a phonebook).
 - What **lazy loading** means.
 - What **Zod** does (validate that JSON matches a shape).
 - What a **config-driven UI** is and why we want one.
-- The end-to-end flow from `acme.app.example.com` to a rendered Acme dashboard.
+- The end-to-end flow from "download installer" to "live Acme dashboard."
 
 If any of those are still fuzzy, re-read §5 and §6 before moving to doc 01.
 
 ---
 
-**Next:** [`01-tenant-resolution.md`](./01-tenant-resolution.md) — how the URL becomes "this is Acme."
+**Next:** [`01-tenant-resolution.md`](./01-tenant-resolution.md) — how a license key becomes "this is Acme."

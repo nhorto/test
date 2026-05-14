@@ -1,657 +1,423 @@
-# 12 — Local Dev and Deploy: Wrangler, Miniflare, and the Path from `git push` to Live
+# 12 — Local Dev and Deploy: Running Tauri, Building Installers, Code Signing, Auto-Updates
 
-> **Pre-reqs:** Read 00, 05, and 11 first. 00 establishes vocabulary. 05 maps the Cloudflare product surface. 11 covers tenant lifecycle and the 3-tenant rule for dev — this doc tells you how to *run* those tenants on your laptop.
->
-> **What you'll know by the end:** What Wrangler is and why it's the only CLI you need. `wrangler.toml` line by line. What bindings are and why your Worker code never holds connection strings. How environments work, and the gotcha where production silently has different bindings than dev. How secrets split between Cloudflare's vault and `.dev.vars`. What Miniflare emulates and what it doesn't (Containers — read this twice). How `wrangler dev` and Vite cooperate. How to run three tenants on `*.localhost` without editing `/etc/hosts`. What `wrangler deploy` actually does — bundle, propagate, live in 15 seconds. How rollback works. How wildcard DNS routes `*.app.example.com` to either Pages or the Worker. Seven specific bugs and their fixes.
+> **Prerequisites:** read 00, 05, and 11 first.
 
-This doc is the bridge between *what we're building* (05–11) and *how you build it on your laptop today*. If 11 is the operational manual for tenants, this is the operational manual for the dev loop.
+> **By the end of this doc you will know:** how to run the Tauri app on your laptop in dev mode. How to build production installers for Windows, Mac, and Linux. The painful (but necessary) code-signing process for each OS. How the auto-updater works and how to host the update manifest. The seven specific bugs that bite people setting this up for the first time, and the fixes.
 
----
-
-## 1. Vocabulary primer (the new terms in this doc)
-
-00 already defined Worker, Pages, KV, R2, D1, slug, subdomain. Here are the new operational terms.
-
-- **Wrangler** — Cloudflare's official CLI. The single tool to develop, test, and deploy everything Cloudflare-related. Replaces clicking in the dashboard.
-- **Miniflare** — a Node.js program that pretends to be the Workers runtime on your laptop. `wrangler dev` runs Miniflare under the hood. Emulates KV, R2, D1, secrets, the Cache API — but not Containers, and Durable Objects only imperfectly.
-- **`wrangler.toml`** — a TOML file at the project root that names your Worker, points at its entry file, and lists every binding.
-- **Binding** — a named handle Cloudflare injects into your Worker at startup. `env.TENANT_CONFIG` is a binding to a KV namespace. Your code never holds a connection string — it just calls methods on the handle.
-- **Environment** — a named override block in `wrangler.toml` (`[env.production]`, `[env.preview]`). Different environments can point at different bindings, secrets, and `[vars]`.
-- **Secret** — a string stored encrypted in Cloudflare's vault, injected as a property on `env`. Set with `wrangler secret put`. Never appears in `wrangler.toml`. Locally faked via `.dev.vars`.
-- **`compatibility_date`** — a date string that pins which version of the Workers runtime your code runs against. Cloudflare ships breaking runtime changes behind date gates.
-- **`compatibility_flags`** — feature flags that toggle specific runtime behaviors independent of the date. `"nodejs_compat"` polyfills Node built-ins like `Buffer` and `EventEmitter`.
-- **PoP (Point of Presence)** — one of Cloudflare's 300+ edge data centers. A deploy propagates to every PoP. There is no "the server."
-- **Isolate** — a V8 sandbox. Each Worker invocation runs in a fresh isolate. Far cheaper than a container.
-- **`.dev.vars`** — a file at the project root, `.env` syntax, holds secrets for local dev. Wrangler reads it on startup. Must be in `.gitignore`.
-- **Wildcard DNS** — a single DNS record (`*.app.example.com`) that matches every subdomain.
-- **Wildcard route** — a Worker route pattern like `*.app.example.com/api/*` that says "every subdomain, on this path prefix, hits this Worker."
-
-These all get re-explained in context. Above is for quick lookup if you skip around.
+This doc is the bridge between *what we're building* (05–11) and *how you build it on your laptop today*. If 11 is the operational manual for tenants, this is the operational manual for the dev loop and the release pipeline.
 
 ---
 
-## 2. What Wrangler is, and why it's the only CLI you need
+## 1. Vocabulary primer
 
-Wrangler is to Cloudflare what `gcloud` is to Google Cloud or `aws` is to AWS — smaller in scope and friendlier. Every operation you might do in the dashboard (create a KV namespace, upload a secret, deploy, roll back) has a Wrangler command. Under the hood it makes REST API calls on your behalf, and locally it wraps Miniflare (§7).
+00 already defined Tauri, webview, Rust, Tauri command, sidecar, auto-updater, installer, code signing. Here are the new operational terms.
 
-Install globally:
+- **`tauri-cli`** — the command-line tool that wraps everything Tauri-related. You'll run `npm run tauri dev`, `npm run tauri build`, etc. Installed as a dev dependency.
+- **`tauri.conf.json`** — the config file at `src-tauri/tauri.conf.json`. Names your app, lists allowed Tauri commands, configures the window, sets the auto-updater URL.
+- **Hot module replacement (HMR)** — Vite's "save a file and see it update without restarting" feature. Works inside Tauri dev mode too.
+- **Bundle / installer** — the .msi (Windows), .dmg (Mac), .AppImage/.deb/.rpm (Linux) file produced by `tauri build`.
+- **Code-signing certificate** — a cryptographic certificate proving the binary came from you. Different ones for each OS.
+- **Notarization** (Mac) — an extra step on top of signing where Apple actually checks your app for malware and stamps it OK. Required for distribution outside the App Store.
+- **EV cert** (Windows) — an "Extended Validation" code signing cert. Required to avoid SmartScreen warnings. Comes on a USB hardware token. The cert lives on the token; signing requires plugging it in.
+- **Auto-updater manifest** — a small JSON file (`latest.json`) hosted at a fixed URL. Tauri's auto-updater polls this URL, compares versions, and downloads if there's a newer one.
+
+---
+
+## 2. The dev loop, step by step
+
+### 2.1 Prerequisites you install once
+
+- **Node.js** (LTS — 20.x or 22.x are both fine). Vite needs it.
+- **Rust** via `rustup`. Tauri's backend.
+- **Platform-specific build deps:**
+  - Windows: Microsoft Visual Studio C++ Build Tools.
+  - macOS: Xcode Command Line Tools (`xcode-select --install`).
+  - Linux: `webkit2gtk-4.1` + `libappindicator3` + a few others; the Tauri docs list them per distro.
+
+The Tauri docs have an OS-by-OS install guide. Run through it once; it takes 30 minutes the first time.
+
+### 2.2 First-time project setup
+
+In an empty repo:
 
 ```bash
-npm install -g wrangler
+$ npm create tauri-app@latest dashboard -- --template react-ts
+$ cd dashboard
+$ npm install
+$ npm run tauri dev
 ```
 
-`-g` puts the binary on your `PATH`. Project-local installs (`pnpm add -D wrangler`, run via `pnpm wrangler`) are better in CI so the version is pinned. Global is simpler when starting.
+The dev command does three things at once:
 
-Log in once per machine:
+1. **Starts Vite** in dev mode. Vite serves the React UI on a local port (e.g., `http://localhost:1420`) with HMR.
+2. **Builds Tauri's Rust binary** in debug mode. Compiles fast (~30s first time, ~2s after).
+3. **Launches the Tauri window**, pointing its webview at the Vite dev server. The window opens.
+
+Edit `src/App.tsx`, save, watch it hot-reload inside the Tauri window. Edit `src-tauri/src/main.rs`, save, Tauri restarts the binary (slower than HMR — a few seconds). React state is lost on Rust restart, which can be annoying for iteration; minimize Rust changes during UI work.
+
+### 2.3 Activating in dev (without juggling real license keys)
+
+From doc 01 §6:
 
 ```bash
-wrangler login
+$ DEV_TENANT=acme npm run tauri dev
 ```
 
-This opens a browser OAuth flow and writes a token to `~/.wrangler/config/default.toml`. That file holds an OAuth token plus your account ID. **Treat it like an SSH private key** — never commit, never paste in chat. For multiple Cloudflare accounts (personal vs production), set `CLOUDFLARE_API_TOKEN` as a per-command override.
+This sets a dev-only env var that the Rust side reads on startup. If present, Rust writes a fake `activation.json` with `tenant: "acme"` and skips the activation screen. Only works in debug builds.
 
-`wrangler whoami` prints your email and account name when login worked.
+For testing the real activation flow, generate a dev license key with `tools/sign-license.ts` and paste it in normally.
+
+### 2.4 Running against a real gateway
+
+Two options:
+
+**Option A — gateway on localhost.** Run the gateway service on your laptop. Use `http://localhost:8080` as the gateway URL in the dev license key. Useful for end-to-end dev. Doc 06 §5 has the gateway config; run it with `uvicorn` or whatever.
+
+**Option B — mock gateway responses.** Add a flag to the Rust `fetch_metric` command: if `MOCK_GATEWAY=1` and we're in debug build, return canned JSON for known metric IDs. Faster to set up, doesn't exercise the network path.
+
+Use Option B for fast iteration, Option A when working on gateway-related changes.
 
 ---
 
-## 3. `wrangler.toml` line by line — the headline artifact
-
-Every Worker project has one `wrangler.toml` at its root. This is the file you'll edit most often as the dev loop matures, so it earns the longest walk in the doc.
-
-Start with the minimum:
-
-```toml
-name                = "powerfab-api"
-main                = "src/worker/index.ts"
-compatibility_date  = "2025-04-01"
-compatibility_flags = ["nodejs_compat"]
-```
-
-Walk:
-
-- `name = "powerfab-api"` — the Worker's name in Cloudflare's system. This name shows up in the dashboard, in deploy logs, and in the default Workers-assigned subdomain. If two Workers share a name, the newer deploy *overwrites* the older one. Pick a name that's specific to the project.
-- `main = "src/worker/index.ts"` — the entry file. Wrangler's bundler (esbuild) starts here, follows every `import`, and tree-shakes the rest. If this path is wrong, deploy fails immediately with `could not resolve entry point` — almost always a typo.
-- `compatibility_date = "2025-04-01"` — pins the runtime version. Cloudflare ships breaking runtime changes behind date gates so old Workers don't break when they upgrade the engine. You opt in by moving this date forward. **Don't leave it at the project-creation default forever.** Update it once every few months: bump the date in a branch, run your tests, deploy to preview, smoke test, merge. Setting it too far in the future errors at deploy time.
-- `compatibility_flags = ["nodejs_compat"]` — feature flags independent of the date. `"nodejs_compat"` polyfills Node.js built-ins (`Buffer`, `events`, `crypto`, etc.) that vanilla Workers don't expose. Without this flag, any npm package that does `require('events')` throws at runtime. For a TypeScript project pulling in real npm dependencies, you almost always want this on.
-
-That four-line block is enough to deploy an empty Worker. Now the bindings.
-
----
-
-## 4. Bindings — the part that throws beginners
-
-A binding is a named handle Cloudflare injects into your Worker's `env` object at startup. The key insight: **your Worker code never holds credentials or connection strings.** It calls methods on the handle. Cloudflare wires it to the right resource at runtime based on `wrangler.toml`.
-
-**Before** (the way most server code in other ecosystems looks):
-
-```ts
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
-const kv = new RedisClient({ url: process.env.REDIS_URL, token: process.env.REDIS_TOKEN });
-```
-
-You're juggling URLs and tokens. Each one might be wrong, leaked, or pointing at the wrong environment.
-
-**After** (with bindings):
-
-```ts
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const config = await env.TENANT_CONFIG.get("acme");
-    return new Response(config);
-  }
-};
-```
-
-`env.TENANT_CONFIG` is a `KVNamespace` handle. No URL, no token in your code. Switching environments means *zero code changes* — the binding name stays the same; only the underlying namespace ID differs.
-
-Each binding type has its own TOML block.
-
-### 4.1 KV namespace
-
-```toml
-[[kv_namespaces]]
-binding    = "TENANT_CONFIG"
-id         = "abc123def456..."
-preview_id = "xyz789..."
-```
-
-Walk:
-
-- `[[kv_namespaces]]` — the double brackets mean "this is one item in an array." You can have multiple `[[kv_namespaces]]` blocks for multiple KV bindings.
-- `binding = "TENANT_CONFIG"` — the name your Worker code uses (`env.TENANT_CONFIG`). All caps by convention; not enforced.
-- `id = "abc123def456..."` — the production KV namespace's ID, from `wrangler kv:namespace create TENANT_CONFIG`.
-- `preview_id = "xyz789..."` — the namespace `wrangler dev` writes to. You created this with `wrangler kv:namespace create TENANT_CONFIG --preview`. Different ID, separate from production.
-
-Methods available on the binding: `get`, `put`, `delete`, `list`. You'll spend most of your KV time on `get` and `put`.
-
-### 4.2 R2 bucket
-
-```toml
-[[r2_buckets]]
-binding     = "SNAPSHOTS"
-bucket_name = "powerfab-snapshots"
-```
-
-Walk:
-
-- `binding = "SNAPSHOTS"` — your code accesses this as `env.SNAPSHOTS`.
-- `bucket_name = "powerfab-snapshots"` — the actual R2 bucket name in your account.
-
-`env.SNAPSHOTS` is an `R2Bucket`. Methods: `get`, `put`, `list`, `delete`. **Important**: R2 returns objects as `ReadableStream` bodies, not strings. To get a string you `await` the body's `.text()`.
-
-### 4.3 D1 database
-
-```toml
-[[d1_databases]]
-binding       = "AUTH_DB"
-database_name = "powerfab-auth"
-database_id   = "11111111-2222-3333-4444-555555555555"
-```
-
-Walk:
-
-- `binding = "AUTH_DB"` — accessed as `env.AUTH_DB`.
-- `database_name` — the human-readable name; mostly for logs and the dashboard.
-- `database_id` — the UUID that uniquely identifies the database.
-
-Methods center on `prepare(sql).bind(...args).run()` for INSERT/UPDATE/DELETE and `.all()` for SELECT.
-
-### 4.4 Service binding (Worker-to-Worker)
-
-```toml
-[[services]]
-binding = "CONTAINER_RUNNER"
-service = "powerfab-container-worker"
-```
-
-Walk:
-
-- `binding = "CONTAINER_RUNNER"` — accessed as `env.CONTAINER_RUNNER`.
-- `service = "powerfab-container-worker"` — the `name` of another Worker in the same Cloudflare account.
-
-Service bindings let one Worker call another over Cloudflare's internal network. No public internet, no extra latency, no API token to manage. Used when an HTTP-shaped contract between two Workers makes sense.
-
-### 4.5 Plain environment variables
-
-```toml
-[vars]
-ENVIRONMENT = "production"
-MAX_TENANTS = "50"
-```
-
-Walk:
-
-- `[vars]` — a single block (not `[[vars]]`) holding string-valued config.
-- `ENVIRONMENT = "production"` — accessed as `env.ENVIRONMENT`. Always a string. To get a number, parse it: `Number(env.MAX_TENANTS)`.
-
-`[vars]` values are committed to source control. Use them for non-secret configuration like flags, names, and counts. Never put a password or API key here.
-
-### 4.6 Secrets (the missing entry)
-
-Secrets do **not** appear in `wrangler.toml`. They're set out-of-band with `wrangler secret put`, stored encrypted in Cloudflare's vault, and injected at runtime as plain strings on `env`. The next section walks them in detail.
-
-The pattern: at runtime, your Worker can't tell whether a value on `env` came from `[vars]`, came from a secret, or came from `.dev.vars`. They all surface as plain strings. The split is purely about **how they're stored on disk and who can see them** — secrets get encrypted; `[vars]` are plaintext in your repo.
-
----
-
-## 5. Secrets and `.dev.vars`
-
-Set a secret for production:
-
-```bash
-wrangler secret put STRIPE_SECRET_KEY --env production
-```
-
-Wrangler prompts for the value (no terminal echo, no shell history). The value goes to Cloudflare's vault. Your code reads `env.STRIPE_SECRET_KEY` as a plain string.
-
-If you forget `--env production`, Wrangler sets the secret on the *default* untagged Worker, not the one production traffic hits. Your code then reads `undefined` in production. This is BUG #3 in §14 — easy to do, harder to diagnose.
-
-List what's set:
-
-```bash
-wrangler secret list --env production
-```
-
-Names only, never values. No way to read a secret back. If you forgot what you set, rotate it.
-
-### 5.1 Local dev: `.dev.vars`
-
-Secrets in Cloudflare's vault aren't pulled down locally. Instead create `.dev.vars` at the project root, `.env` syntax:
-
-```
-STRIPE_SECRET_KEY=sk_test_thisisntreal
-INTERNAL_SIGNING_KEY=dev-only-not-real
-```
-
-Walk:
-
-- One `KEY=value` per line. Quotes only if the value has spaces.
-- Wrangler reads on startup; no file watcher (BUG #6).
-- **Add `.dev.vars` to `.gitignore` immediately**, before you put any value in it. Otherwise the first commit leaks whatever placeholder you typed.
-
-Every key in `.dev.vars` surfaces on `env` as if it were a real secret. Your Worker code is identical between local and prod.
-
-**Before** (per-env switches in code):
-
-```ts
-const apiKey = isDev ? "test_key" : process.env.STRIPE_KEY;
-```
-
-**After** (`.dev.vars` locally, `wrangler secret put` in production):
-
-```ts
-const apiKey = env.STRIPE_SECRET_KEY;
-```
-
-Same line, two environments, zero branching. The split is in configuration, not code.
-
----
-
-## 6. Environments — the part where production disagrees with dev
-
-Wrangler lets you define named environment overrides in a single `wrangler.toml`. The most common pattern is dev (the top-level baseline) plus preview plus production.
-
-```toml
-name               = "powerfab-api"
-main               = "src/worker/index.ts"
-compatibility_date = "2025-04-01"
-
-[vars]
-ENVIRONMENT = "development"
-
-[env.preview]
-name = "powerfab-api-preview"
-[env.preview.vars]
-ENVIRONMENT = "preview"
-FEATURE_FLAGS = "new-dashboard"
-
-[env.production]
-name = "powerfab-api-production"
-[env.production.vars]
-ENVIRONMENT = "production"
-
-[[env.production.kv_namespaces]]
-binding    = "TENANT_CONFIG"
-id         = "abc123..."
-```
-
-Walk:
-
-- The first four lines are the baseline. They apply to everything unless overridden.
-- `[env.preview]` and `[env.production]` declare two named environments. Each can override `name`, `[vars]`, bindings, secrets — anything.
-- `[env.preview.vars]` is a sub-block: "the `[vars]` table inside the `preview` environment." TOML uses dotted paths to nest.
-- `[[env.production.kv_namespaces]]` declares a KV binding *for the production environment only*.
-
-Run a specific environment locally:
-
-```bash
-wrangler dev --env preview
-```
-
-Deploy a specific environment:
-
-```bash
-wrangler deploy --env production
-```
-
-### 6.1 The non-inheritance gotcha
-
-Here's the trap. Bindings declared at the top level are **not** automatically inherited into named environments. If your top level has `[[kv_namespaces]]` with `binding = "TENANT_CONFIG"`, and you run `wrangler deploy --env production`, the production Worker gets *no* KV bindings at all unless you also declare `[[env.production.kv_namespaces]]`.
-
-This is the single most common "works in dev, broken in prod" bug Cloudflare beginners hit. Local `wrangler dev` (no `--env` flag) reads top-level bindings. Production `wrangler deploy --env production` reads only `[env.production.*]` bindings. They diverge silently.
-
-**Before** (looks fine, breaks in prod):
-
-```toml
-# top-level — used by wrangler dev
-[[kv_namespaces]]
-binding = "TENANT_CONFIG"
-id      = "abc123..."
-
-[env.production]
-name = "powerfab-api-production"
-# no kv_namespaces block — production has NO bindings
-```
-
-**After** (re-declare for every environment):
-
-```toml
-[[kv_namespaces]]
-binding = "TENANT_CONFIG"
-id      = "abc123..."
-preview_id = "xyz789..."
-
-[env.production]
-name = "powerfab-api-production"
-
-[[env.production.kv_namespaces]]
-binding = "TENANT_CONFIG"
-id      = "prod_id_here"
-```
-
-The `binding` name (`TENANT_CONFIG`) must match exactly — that's the name your code uses. The `id` is the new bit, pointing at production's separate KV namespace. Same story for R2, D1, services, and secrets: re-declare per environment.
-
-Once you've been bitten once you'll never forget. The first time, you'll burn an evening.
-
----
-
-## 7. Local dev: `wrangler dev` and Miniflare
-
-`wrangler dev` starts a local HTTP server (default port 8787) running your Worker under Miniflare — an in-process Node.js reimplementation of the V8 isolate environment Workers run in at the edge.
-
-```bash
-wrangler dev
-```
-
-Open `localhost:8787`, your Worker responds. Edits hot-reload.
-
-What Miniflare emulates well:
-
-- **KV** — operations work; data is in-memory and wipes on restart. Use `--persist-to <dir>` to write to disk.
-- **R2** — in-memory blobs, restart wipes.
-- **D1** — real SQLite file on disk, persisted between restarts.
-- **Cache API** — local cache, scoped to the dev session.
-- **`[vars]` and secrets** — from `wrangler.toml` and `.dev.vars`.
-- **The fetch and request/response plumbing** — close enough that you'll rarely notice.
-
-What Miniflare does NOT emulate:
-
-- **Containers.** Cloudflare Containers (the .NET 8 nightly job — 06, 07) require the real Cloudflare infrastructure. No local runtime. Workaround in §10.
-- **Durable Objects.** Emulated with subtle behavioral differences. PowerFab's MVP doesn't use them.
-- **Real KV persistence by default.** Use `--persist-to ./.wrangler-state` or `wrangler dev --remote` (real Cloudflare resources from local code — slower, not free, but accurate).
-
----
-
-## 8. Pages-side dev: Vite alongside Wrangler
-
-PowerFab's frontend is a Vite + React 19 app deployed to Cloudflare Pages. The dev stack is two terminals:
-
-```
-Terminal 1: pnpm dev          → Vite dev server at localhost:5173
-Terminal 2: wrangler dev      → Hono Worker at localhost:8787
-```
-
-Vite serves the React SPA with hot module reload. Wrangler serves the API. They cooperate via a Vite proxy so your frontend code can call `/api/...` and have it reach the Worker without CORS gymnastics.
-
-In `vite.config.ts`:
-
-```ts
-server: {
-  proxy: {
-    '/api': 'http://localhost:8787'
+## 3. The `tauri.conf.json` file
+
+The single most important config file. Lives at `src-tauri/tauri.conf.json`. A pared-down example:
+
+```jsonc
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "productName": "PowerFab Dashboard",
+  "version": "1.0.0",
+  "identifier": "com.yourcompany.dashboard",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "PowerFab Dashboard",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 720
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.icns", "icons/icon.ico", "icons/32x32.png", "icons/128x128.png"],
+    "category": "Productivity",
+    "publisher": "Your Company, LLC",
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      },
+      "signCommand": null
+    },
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.15"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://updates.dashboard.example.com/latest.json"],
+      "pubkey": "BAKED_IN_UPDATER_PUBLIC_KEY_HERE"
+    }
   }
 }
 ```
 
-Walk:
+The fields that matter most:
 
-- `server.proxy` — Vite dev-server config. Only applies in dev.
-- `'/api': 'http://localhost:8787'` — every request to a path starting with `/api` gets forwarded to the local Worker.
-
-The browser thinks it's calling `localhost:5173/api/tenants`. Vite forwards it to `localhost:8787/api/tenants`. The Worker responds. The browser sees a same-origin response and is happy.
-
-**Why two servers instead of one?** Cloudflare offers `wrangler pages dev ./dist`, which serves the built static output and runs the Worker function side. It's closer to production but slower for frontend iteration — every change requires a Vite build. For a solo dev iterating on UI, the two-terminal setup with `pnpm dev` and proxy is faster. Reach for `wrangler pages dev` only when testing the Pages-specific routing layer (`_redirects`, `_headers` files, custom 404 pages).
-
----
-
-## 9. Multi-tenant local testing — `*.localhost` and the 3-tenant rule
-
-PowerFab routes by subdomain in production: `acme.app.example.com`. Locally you want the same shape: `acme.localhost`, `bobsteel.localhost`, `crucible.localhost`.
-
-**Good news**: modern browsers (Chrome, Firefox, Safari) automatically resolve `*.localhost` to `127.0.0.1` without any `/etc/hosts` edits. Open `acme.localhost:5173` and the request hits your local Vite server with `Host: acme.localhost`. Your Worker can extract the tenant slug from that header.
-
-**Fallback** for older browsers, command-line `curl`, or Node.js `fetch` calls that bypass the OS resolver: add explicit entries to `/etc/hosts`:
-
-```
-127.0.0.1  acme.localhost
-127.0.0.1  bobsteel.localhost
-127.0.0.1  crucible.localhost
-```
-
-One line per tenant. Save the file. No restart needed. Your Mac's resolver picks them up immediately.
-
-### 9.1 Extracting the tenant slug from the Host header
-
-The same code runs locally and in production. In your Worker:
-
-```ts
-const host = new URL(request.url).hostname;   // "acme.localhost" or "acme.app.example.com"
-const tenant = host.split('.')[0];             // "acme"
-```
-
-Walk:
-
-- `new URL(request.url).hostname` — gives you just the hostname, no port, no path. `acme.localhost:5173/api/tenants` becomes `acme.localhost`.
-- `host.split('.')[0]` — splits on dots and takes the first segment. Works for both `acme.localhost` and `acme.app.example.com` because the slug is always the leftmost label.
-
-This is the production code path. There's no dev-only branch. The same line works in three environments because the slug is always in the same position.
-
-### 9.2 The 3-tenant rule
-
-11 covers the operational reasoning; here's the dev-loop version. Run **three** local tenants, not one or two:
-
-- One tenant catches zero isolation bugs. Hardcoded slugs and global caches all look fine.
-- Two tenants catches *some* isolation bugs but can't distinguish "Acme leaks to Bob" from "Bob leaks to Acme."
-- Three tenants triangulates. If logged in as Crucible you see Bob's data, the bug is in request handling, not a swapped pair.
-
-Set up `tenants/acme.json`, `tenants/bobsteel.json`, `tenants/crucible.json` with deliberately *different* fixture data. Acme has all modules; Bob has only `inspections`; Crucible has `time` plus `production`. If a single screenshot can't tell you which tenant you're looking at, your test data is too similar.
-
-This is one of those rules that costs nothing to follow on day one and is annoying to retrofit at tenant 20.
+- **`identifier`** — a unique string for your app. Used by the OS to namespace things (the app-data directory comes from this). Don't change it after launch; doing so means existing installs lose their settings.
+- **`version`** — the version that gets compared by the auto-updater. Bump on every release.
+- **`build.frontendDist`** — where the production React build lives. `npm run build` writes here.
+- **`security.csp`** — Content Security Policy for the webview. Restrict to `'self'` so the webview can't load arbitrary scripts. (This is also why all data fetches go through Rust — the CSP forbids the webview from making outbound HTTP calls directly.)
+- **`bundle.targets`** — which installers to build. `"all"` means everything supported on the current OS; you can also list explicitly (`["msi", "nsis"]` for Windows, etc.).
+- **`plugins.updater`** — the auto-updater config. `endpoints` is where the app polls for updates; `pubkey` verifies update manifests are signed by us. See §6.
 
 ---
 
-## 10. The Container local-dev workaround
+## 4. Building production installers
 
-PowerFab's nightly job runs as a .NET 8 Container, scheduled by a Worker. Containers don't run in Miniflare. Two options:
-
-**Option A: stub the Container call.** Run the .NET project standalone:
+Run:
 
 ```bash
-cd container
-dotnet run
+$ npm run tauri build
 ```
 
-The .NET app starts an HTTP server on `http://localhost:5000`. In your Worker, behind a dev guard, replace the service-binding call with a fetch to that local URL:
+This compiles Rust in release mode (~3–5 minutes), runs `npm run build` to produce the React production bundle, packages everything into installers for the current OS, and outputs them to `src-tauri/target/release/bundle/`.
 
-```ts
-const isDev = (env.ENVIRONMENT ?? 'development') === 'development';
-const containerResponse = isDev
-  ? await fetch('http://localhost:5000/run', { method: 'POST', body: JSON.stringify(payload) })
-  : await invokeRunner(env.CONTAINER_RUNNER, payload);
-```
+You'll get something like:
 
-Walk:
+- `src-tauri/target/release/bundle/msi/PowerFab Dashboard_1.0.0_x64_en-US.msi` (Windows)
+- `src-tauri/target/release/bundle/dmg/PowerFab Dashboard_1.0.0_x64.dmg` (Mac)
+- `src-tauri/target/release/bundle/appimage/powerfab-dashboard_1.0.0_amd64.AppImage` (Linux)
 
-- `env.ENVIRONMENT` is the `[vars]` value — `"development"` locally, `"production"` in prod.
-- Dev branch: hits the .NET process running under `dotnet run` in your other terminal — `localhost:5000` is the *only* full-URL shape we use in code, allowed here because that's where the local server listens.
-- Prod branch: delegates to a small `invokeRunner` helper that wraps `env.CONTAINER_RUNNER.fetch(...)` — the service-binding API needs a `Request`-shaped input, and the helper hides that ceremony so the snippet stays focused on the dev/prod split. The Worker-to-Container call never leaves Cloudflare's network.
+The build only produces installers for the host OS. To build for all three OSes, you need either three machines or a CI pipeline that runs on three OSes — covered in doc 13.
 
-**The `isDev` guard is critical.** Without it, a localhost URL ends up in production code and every request times out. Code-review this branch every PR.
+### 4.1 Build sizes
 
-**Option B: deploy a preview Container, use `wrangler dev --remote`.** Slower, more accurate. Reach for it when you suspect a service-binding contract bug.
+Tauri installers are usually small:
+- Windows .msi: ~5–10 MB
+- macOS .dmg: ~6–12 MB
+- Linux .AppImage: ~10–18 MB (includes the AppImage runtime)
 
-Day-to-day: Option A. Final pre-merge on a Container change: Option B once.
+Compare with Electron at ~80 MB. The savings are real because we're using the OS's built-in webview.
 
----
+### 4.2 What about ARM Macs / ARM Windows?
 
-## 11. The deploy flow — what `wrangler deploy` actually does
+Apple Silicon Macs need an arm64 build. From an Intel Mac, you cross-compile with:
 
 ```bash
-wrangler deploy --env production
+$ npm run tauri build -- --target aarch64-apple-darwin
 ```
 
-That command kicks off this:
-
-```
-Local machine                Cloudflare API              Edge PoPs (300+)
-     |                              |                            |
-     |-- bundle (V8 bytecode) ----> |                            |
-     |                              |-- version stored --------> |
-     |                              |-- propagate to PoPs -----> |
-     |<-- deploy ID returned ----   |                            |
-     |                              |                         (live ~15s)
-```
-
-Step by step:
-
-1. **Bundle.** Wrangler runs esbuild on `main` — single bundled JS file plus source maps.
-2. **Upload.** Bundle gzipped, POSTed to Cloudflare's API along with `wrangler.toml` metadata.
-3. **Version stored.** Cloudflare assigns a version ID. The previous version stays around for rollback (§12).
-4. **Propagate.** Cloudflare pushes the version to every edge PoP. Within 15–30 seconds every PoP has it.
-5. **First request to a PoP** with the new version cold-starts a fresh isolate. No "restart" — old isolates finish in-flight requests naturally; new requests get new code.
-6. **Deploy ID returned.** Wrangler prints the version ID. Save it — you'll use it for rollback.
-
-For Pages:
+From an Apple Silicon Mac, do the same for x64:
 
 ```bash
-wrangler pages deploy ./dist --project-name powerfab-dashboard
+$ npm run tauri build -- --target x86_64-apple-darwin
 ```
 
-Walk:
-
-- `pages deploy` — Pages-specific deploy command.
-- `./dist` — your Vite build output directory. Run `pnpm build` first.
-- `--project-name powerfab-dashboard` — must match an existing Pages project.
-
-Pages keeps every uploaded build. Deploys are essentially "upload static files; tag this build as production."
-
----
-
-## 12. Rollback — instant, painless, do it without panicking
-
-Every deploy keeps the previous version. Rolling back is a metadata flip, not a re-upload.
+Or, more easily, ship a "universal" build that contains both:
 
 ```bash
-wrangler rollback                # to the previous deployment
-wrangler rollback <version-id>   # to a specific named version
+$ npm run tauri build -- --target universal-apple-darwin
 ```
 
-List recent deployments with `wrangler deployments list`. The dashboard equivalent: Workers and Pages → the Worker → Deployments tab → "Rollback" next to any prior version. For Pages, dashboard is primary: pick the project, find the build, click Rollback. Pages doesn't rebuild — it re-routes traffic to the prior artifact.
-
-Time to rollback live: the same 15–30 second window as a forward deploy. No extra cost, no extra risk. **If a deploy is breaking production, hit rollback first, debug second.** "Fix-forward" is fine for senior teams; for a solo dev, rollback gets you back to known-good in under a minute.
+ARM Windows is rare enough you can skip it for now.
 
 ---
 
-## 13. Custom domain wiring — wildcard DNS plus wildcard routes
+## 5. Code signing — the painful part
 
-PowerFab uses `*.app.example.com`. Two things need to be configured for `acme.app.example.com` to actually serve a request: DNS and Worker routes.
+Unsigned installers trigger scary warnings (Windows SmartScreen) or outright refuse to launch (macOS Gatekeeper). You must sign.
 
-### 13.1 The DNS record
+### 5.1 Windows signing
 
-In Cloudflare DNS, add one wildcard CNAME:
+You need a **code-signing certificate**, ideally an **EV (Extended Validation) cert**. Difference:
 
-```
-*.app.example.com  →  CNAME  →  the Pages project's assigned subdomain  (proxied)
-```
+- **Standard OV cert**: ~$100–250/year, file-based. Avoids the "from an unknown publisher" warning *after* SmartScreen builds reputation (usually thousands of downloads). New customers may still see warnings for months.
+- **EV cert**: ~$300–500/year, ships on a USB hardware token. Avoids SmartScreen warnings *immediately*. Required for any commercial product.
 
-Walk:
+Get the EV cert. Sources: DigiCert, Sectigo, SSL.com.
 
-- `*.app.example.com` — wildcard pattern. Matches every subdomain at that depth: `acme.app.example.com`, `bobsteel.app.example.com`, etc.
-- The target is the subdomain Cloudflare assigned your Pages project when you created it.
-- `proxied` (the orange cloud in Cloudflare's DNS UI) means Cloudflare's edge intercepts the request. Without this, traffic goes directly to the Pages backend without passing through your Workers — defeats the whole architecture.
+**Signing workflow:**
 
-One DNS record. Every new tenant subdomain works without a DNS change.
+1. The EV cert lives on a USB token plugged into the signing machine.
+2. In `tauri.conf.json`:
+   ```jsonc
+   "bundle": {
+     "windows": {
+       "signCommand": "signtool.exe sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a \"%1\""
+     }
+   }
+   ```
+   `signtool` is part of the Windows SDK. The `/a` flag picks the best cert from the certificate store (which the token populates when plugged in).
+3. After `tauri build` produces the .msi, signtool signs it.
 
-### 13.2 The Worker route
+In CI, you can use a remote-signing service (DigiCert KeyLocker, AzureSignTool with Azure Key Vault) so you don't have to ship the USB token around. Doc 13 has the CI pieces.
 
-In `wrangler.toml`, declare which paths go to the Worker:
+### 5.2 macOS signing + notarization
 
-```toml
-[[env.production.routes]]
-pattern   = "*.app.example.com/api/*"
-zone_name = "app.example.com"
-```
+For Mac you need an **Apple Developer Program** membership ($99/year). It gives you:
 
-Walk:
+- A **Developer ID Application certificate** for signing.
+- The ability to **notarize** builds (submit to Apple, get a stamp back).
 
-- `[[env.production.routes]]` — array entry, scoped to production environment.
-- `pattern = "*.app.example.com/api/*"` — match any subdomain under `app.example.com`, but only paths starting with `/api/`. This is the load-bearing detail (see BUG #7 below).
-- `zone_name = "app.example.com"` — the Cloudflare zone this route belongs to. Must be an active zone in the same account.
+**Signing + notarization workflow:**
 
-### 13.3 The full request flow
+1. Generate the Developer ID Application cert in Apple's developer portal. Download it to your Mac's Keychain.
+2. In `tauri.conf.json`:
+   ```jsonc
+   "bundle": {
+     "macOS": {
+       "signingIdentity": "Developer ID Application: Your Company, LLC (XXXXXXXXXX)",
+       "providerShortName": "XXXXXXXXXX"
+     }
+   }
+   ```
+3. Set env vars before `tauri build`:
+   ```bash
+   export APPLE_ID="your-apple-id@example.com"
+   export APPLE_PASSWORD="<app-specific-password>"  # NOT your iCloud password; generate one in appleid.apple.com
+   export APPLE_TEAM_ID="XXXXXXXXXX"
+   ```
+4. `tauri build` signs the .app, packages it into a .dmg, signs the .dmg, submits to Apple for notarization, waits (1–15 minutes), staples the notarization to the .dmg.
 
-```
-Browser → acme.app.example.com/api/tenants
-         → wildcard CNAME resolves, edge intercepts
-         → Route match /api/* → powerfab-api Worker
-         → Worker reads "acme" from Host header → tenant-scoped data
+The first time you do this, things will go wrong. Common errors:
 
-Browser → acme.app.example.com/  (no /api/)
-         → wildcard CNAME resolves, edge intercepts
-         → No Worker route matches → Pages serves React SPA
-```
+- "An app-specific password is required" — generate one at `appleid.apple.com → Sign-In and Security → App-Specific Passwords`.
+- "The provider could not be found" — make sure `APPLE_TEAM_ID` matches your developer team.
+- Notarization fails with "the binary contains an unsigned framework" — Tauri's bundling of dependencies needs `--deep` signing or a `hardenedRuntime` flag.
 
-Two routes, one domain. Worker handles API; Pages handles the SPA. Both see `Host: acme.app.example.com` and extract the slug from it.
+Allow a full day to get the first signed + notarized Mac build out.
 
----
+### 5.3 Linux signing
 
-## 14. Pitfalls — the seven bugs you'll hit, and the fix for each
+Linux doesn't really have a signing equivalent. AppImage builds are unsigned by default; users either trust your domain (download from `https://updates.dashboard.example.com/...`) or don't.
 
-Each has bitten real Cloudflare beginners. The fix is rarely complicated; the diagnosis is.
-
-**BUG #1: "binding not found" in production, works fine in `wrangler dev`.**
-**FIX:** Named environments don't inherit top-level bindings. Re-declare every `[[kv_namespaces]]`, `[[r2_buckets]]`, `[[d1_databases]]`, and `[[services]]` block under the matching `[[env.production.*]]` path. The `binding` names must match the strings your code reads. See §6.1.
-
-**BUG #2: `compatibility_date` is stale; a new npm package fails at runtime with `X is not a function`.**
-**FIX:** Update `compatibility_date` to within the last 6 months. Many runtime fixes are date-gated. Update in a branch, deploy to preview, smoke-test, merge. Don't jump forward by years at once — increments of a few months catch any single breaking change in isolation.
-
-**BUG #3: A secret set via `wrangler secret put` reads as `undefined` in the Worker.**
-**FIX:** Confirm you set it for the right environment. `wrangler secret put NAME` without `--env` sets it on the default, untagged Worker. For production, run `wrangler secret put NAME --env production`. Verify with `wrangler secret list --env production`.
-
-**BUG #4: `wrangler deploy` exits with `Not logged in` or `403 Forbidden`.**
-**FIX:** Run `wrangler login` again — tokens expire after inactivity. For CI/CD, set `CLOUDFLARE_API_TOKEN` to a token with `Workers Scripts: Edit` permission. Generate it in the Cloudflare dashboard's API tokens page; store as a CI secret.
-
-**BUG #5: Local KV reads return `null` for keys that exist in production.**
-**FIX:** Local KV is in-memory and starts empty. Either seed it via `wrangler kv:key put --namespace-id=<preview_id> <key> <value>`, or use `wrangler dev --remote` to bind against the real preview namespace.
-
-**BUG #6: `.dev.vars` changes don't take effect after editing.**
-**FIX:** `.dev.vars` is read on `wrangler dev` startup only — there's no file watcher. Stop dev (Ctrl-C) and restart. Same diagnosis if a teammate added a var and you pulled but didn't restart.
-
-**BUG #7: The wildcard route catches static assets and breaks the Pages site.**
-**FIX:** Scope the route pattern to `*.app.example.com/api/*`, not `*.app.example.com/*`. A catch-all intercepts every request, including SPA HTML and JS bundles, routing them to a Worker that doesn't serve them. See §13.
-
-Honorable mention: `wrangler dev` (local Miniflare) vs `wrangler dev --remote` (local code against real Cloudflare). They differ for KV, R2, D1. If local data acts strangely, try `--remote` to compare.
+For .deb / .rpm packages, you'd sign with GPG and publish a repo, but that's only worth it if you have many Linux customers. For our use case (mostly Windows + some Mac), don't bother.
 
 ---
 
-## 15. What this means for PowerFab specifically
+## 6. The auto-updater
 
-The doc above is general Cloudflare knowledge. Here's the project-specific glue.
+Tauri ships with a built-in updater. Setup:
 
-**Subdomain-per-tenant lines up with the wildcard pattern.** The architecture from 05 and 11 falls out of one wildcard CNAME plus one `/api/*`-scoped wildcard route. When you onboard tenant N (per 11's checklist), step 2 is "verify DNS" — the wildcard already absorbs it. Set it up once, file it under "infrastructure that runs itself."
+### 6.1 Generate an updater key pair (one time)
 
-**The 3-tenant rule from 11 needs `*.localhost` from §9 to be ergonomic.** Without auto-resolving `*.localhost`, every dev session starts with `/etc/hosts` edits. With it, `acme.localhost:5173`, `bobsteel.localhost:5173`, `crucible.localhost:5173` all just work. The slug-extraction line `host.split('.')[0]` is identical between local and production — it gets exercised every dev session, which is exactly the load-bearing code path you want hammered.
+```bash
+$ npx tauri signer generate -w ~/.tauri/updater.key
+```
 
-**The Container local-dev workaround (§10) is for the .NET 8 nightly extraction job.** PowerFab's nightly job (07) is the one piece you literally cannot run inside `wrangler dev`. Run `dotnet run` in one terminal, `wrangler dev` in another, use the `isDev`-guarded fetch to bridge. Code-review the `isDev` branch every PR — this is the kind of thing that ships to prod and stays broken until 2 a.m. cron fails.
+Outputs a private key and a public key. The public key goes in `tauri.conf.json` under `plugins.updater.pubkey`. The private key stays in your password manager — it signs every update bundle.
 
-**Vercel is dev-only; production is Cloudflare.** Locked in per project decisions. Vercel hosts early-days PR previews where iteration speed beats hosting fidelity. The `wrangler deploy --env production` flow in §11 — V8 bytecode, propagate to 300+ PoPs, live in 15 seconds — is the only deploy that matters. If you catch yourself depending on Vercel-specific behavior (Edge Functions, Vercel KV, `VERCEL_URL`), back it out before it spreads.
+### 6.2 Build + sign update bundles
 
-**Two environments: `preview` and `production`.** No `staging`. For a solo dev that's overhead — `preview` is your validation tier (deploy a feature branch, smoke-test, merge). Production deploys land on `main`. Once there's a team, revisit.
+```bash
+$ TAURI_SIGNING_PRIVATE_KEY=$(cat ~/.tauri/updater.key) \
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+  npm run tauri build
+```
 
-**Where multi-tenant ops and deploy converge:** every `tenants/<slug>.json` edit is a git commit. CI runs the Zod validator (11). On merge, GitHub Actions runs `wrangler deploy --env production` and `wrangler pages deploy ./dist --project-name powerfab-dashboard`. Within 30 seconds the new config is live everywhere. The deploy *is* the provisioning. Per-tenant work for tenant #2 through #50: edit JSON, `wrangler secret put TENANT_<SLUG>_DB_PASSWORD --env production`, push.
+This produces, in addition to the installers, an `*.sig` file per installer (the signature) and a manifest stub.
+
+### 6.3 Host the update manifest
+
+Create `latest.json` at the URL in `tauri.conf.json` (`https://updates.dashboard.example.com/latest.json`). Format:
+
+```jsonc
+{
+  "version": "1.2.3",
+  "notes": "Bug fixes and a new Estimating metric.",
+  "pub_date": "2026-05-14T10:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "<contents of the .sig file>",
+      "url": "https://updates.dashboard.example.com/PowerFab.Dashboard_1.2.3_x64-setup.msi"
+    },
+    "darwin-aarch64": {
+      "signature": "...",
+      "url": "https://updates.dashboard.example.com/PowerFab.Dashboard_1.2.3_aarch64.dmg"
+    }
+  }
+}
+```
+
+Upload the installers to the same domain.
+
+### 6.4 What the app does at runtime
+
+On startup (and periodically thereafter), Tauri's updater plugin:
+
+1. Fetches `https://updates.dashboard.example.com/latest.json`.
+2. Compares `version` against the running version.
+3. If newer, downloads the platform-appropriate installer.
+4. Verifies the signature against the baked-in public key.
+5. Shows the user a "Update available — restart to install" prompt.
+
+If verification fails (e.g., someone tampered with the .msi on the server), the update is rejected. The updater public key is the same kind of "trust anchor" as the license-key public key — bake it in, never change.
+
+### 6.5 Hosting options
+
+The update server is static files. Options:
+
+- **R2 + a public bucket + a Cloudflare-managed domain.** Cheap, fast, zero ops.
+- **S3 + CloudFront.** Standard, slightly more setup.
+- **GitHub Releases.** Tauri has built-in support for GitHub Releases as an update endpoint; great if your repo is open and free if your repo is private and you fit GitHub's bandwidth limits.
+
+Pick one. They're all fine at our scale.
 
 ---
 
-## 16. By the end of this doc you should know
+## 7. The seven specific bugs (and the fixes)
 
-- What Wrangler is and where the auth token lives.
-- The four mandatory keys in `wrangler.toml`: `name`, `main`, `compatibility_date`, `compatibility_flags`.
-- What a binding is, and why your Worker never has connection strings in it.
-- How to declare KV, R2, D1, service, `[vars]`, and secret bindings — and which are committed.
-- Why production bindings don't auto-inherit, and how to re-declare them.
-- How `.dev.vars` works locally and why it must be in `.gitignore` from day one.
-- What Miniflare emulates (KV, R2, D1, secrets, fetch) and what it doesn't (Containers, Durable Objects).
-- The two-terminal Vite + Wrangler setup and why it beats `wrangler pages dev` for frontend iteration.
-- The `*.localhost` trick and the 3-tenant rule from 11.
-- The Container workaround: `dotnet run` plus `isDev`-guarded fetch.
-- What `wrangler deploy` does — bundle, upload, version, propagate, live in 15 seconds.
-- How to roll back instantly.
-- How wildcard DNS plus a `/api/*`-scoped wildcard route splits traffic between Pages and the Worker.
-- The seven bugs in §14, especially BUG #1 (re-declare bindings per env) and BUG #7 (scope the route).
-- The PowerFab-specific pieces in §15: Vercel is dev-only, two environments suffice, every onboard is commit-and-deploy.
+### 7.1 `npm run tauri dev` opens a blank window
 
-If any feel hazy, scroll back. The two sections that earn rereading are §4 (bindings) and §6 (environments) — the difference between "I can deploy a Worker" and "I can deploy a Worker that doesn't surprise me in production."
+Vite is slow to start, Tauri's webview opens before Vite is ready, you see a blank window. Vite catches up after a second; the webview doesn't auto-refresh.
+
+**Fix:** `tauri.conf.json` → `build.beforeDevCommand: "npm run dev"`, and wait for Vite's "ready" message before Tauri opens the window. Or click reload in the dev tools.
+
+### 7.2 Rust changes don't trigger a rebuild
+
+`npm run tauri dev` watches `src-tauri/src/*.rs` but not other files (like Cargo.toml).
+
+**Fix:** Edit a `.rs` file with a trivial change to force a rebuild, then revert.
+
+### 7.3 "Unsigned binary" warning on Windows even with EV cert
+
+You signed, but didn't timestamp.
+
+**Fix:** Use a timestamp server in your sign command (`/tr http://timestamp.digicert.com /td sha256`). Without the timestamp, Windows treats the signature as valid only until your cert expires, then everyone's existing copy stops being trusted.
+
+### 7.4 macOS notarization "in progress" forever
+
+You submitted, didn't wait for the response, the build script exited too early.
+
+**Fix:** Use `xcrun notarytool ... --wait`. Tauri does this by default; if you're running notarization separately, don't forget `--wait`.
+
+### 7.5 Auto-updater fails with "signature mismatch"
+
+Two common causes: (a) the manifest's `signature` field has line breaks in it, breaking parsing; (b) the public key in `tauri.conf.json` was regenerated between releases.
+
+**Fix:** Treat `signature` as a single-line string (no JSON-encoding quirks). Lock the public key for the life of the app.
+
+### 7.6 "WebView2 not found" on Windows 7 (if anyone is still on it)
+
+WebView2 is only included by default on Windows 10/11.
+
+**Fix:** Bundle the WebView2 bootstrapper. Tauri can do this — set `tauri.conf.json` → `bundle.windows.webviewInstallMode = "embedBootstrapper"`. Adds a few MB to the installer but no extra customer steps.
+
+### 7.7 Tauri commands return `null` instead of throwing on Rust errors
+
+A common surprise. If your Rust command returns `Result<T, E>`, `Err(e)` becomes a rejected Promise on the JS side. But if your command is `Result<T, ()>` (unit error), the error becomes `null`.
+
+**Fix:** Return `Result<T, String>` (or another serializable error type). Always. Doc 09's examples do this.
 
 ---
 
-**Next:** 13 (TBD) — likely CI/CD wiring (GitHub Actions to `wrangler deploy`) and observability.
+## 8. A realistic dev → release flow
+
+To pull it together — what a release looks like end to end for a small change:
+
+1. Branch off `main`, make changes, commit.
+2. `npm run tauri dev` — sanity check it works.
+3. Open a PR.
+4. CI (doc 13) runs `npm run validate:tenants`, `npm run tsc`, `npm test`. Green.
+5. Merge to `main`.
+6. CI builds + signs installers for Windows, Mac (notarized), Linux.
+7. CI publishes installers to the update server.
+8. CI updates `latest.json` to point at the new version.
+9. (Hours pass.) Customers' apps poll `latest.json`, see a new version, download it.
+10. User clicks "restart to update," restarts, new version running.
+
+A small change goes from `git push` to "in customers' hands" in roughly 24 hours, gated by users actually restarting their apps.
+
+---
+
+## 9. By the end of this doc you should know
+
+- How to run Tauri in dev mode, with HMR, in under a minute.
+- How to activate the app in dev without juggling real license keys.
+- Every meaningful field of `tauri.conf.json`.
+- How to build installers for Windows, Mac, and Linux.
+- The two flavors of Windows code-signing cert (standard vs. EV) and why EV is worth it.
+- The Mac signing + notarization workflow and the common errors.
+- That Linux signing is not really a thing for desktop.
+- How the Tauri auto-updater works: key pair, signed bundles, `latest.json`, on-launch poll.
+- Where to host the update server (R2, S3, or GitHub Releases — pick one).
+- The seven specific bugs that bite first-time users.
+- The realistic time-to-customer for a release: ~24 hours.
+
+---
+
+**Next:** [`13-ci-cd.md`](./13-ci-cd.md) — automating the build/sign/release flow for all three OSes in GitHub Actions (or your CI of choice).

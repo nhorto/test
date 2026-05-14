@@ -1,12 +1,12 @@
-# 13 — CI/CD with GitHub Actions: Gates, Deploys, and Why a Solo Dev Needs Them
+# 13 — CI/CD with GitHub Actions: Multi-OS Builds, Signing, and Publishing Updates
 
-> **Pre-reqs:** Read `00-start-here.md`, `02-config.md`, `05-cloudflare-architecture.md`, and `11-tenant-lifecycle.md`. 00 has the vocabulary (tenant, slug, KV, R2). 02 explains the tenant config and why it's Zod-validated. 05 explains the Pages + Workers target. 11 explains how a single broken `tenants/<slug>.json` is the highest-impact mistake you can make on this stack — that's the failure mode this doc's gates exist to catch.
->
-> **What you'll know by the end:** What CI/CD actually means in plain English. Eleven pieces of GitHub Actions vocabulary you have to know before the YAML stops looking like alphabet soup. A complete `.github/workflows/deploy.yml` walked line by line. The `validate-tenants.ts` script walked line by line, and why it has to be a hard gate, not a "remember to run it locally" habit. How preview deploys work and why you must isolate the preview KV namespace from production. How secrets get from your repo settings to a running job without ever appearing in a log. Eight bug/fix pairs. How to roll back fast when something does ship broken.
+> **Prerequisites:** read 00, 02, 05, 11, and 12. 12 in particular is the foundation — this doc is "automate everything 12 walks through manually."
 
-This is the doc that turns "I push to main and hope it works" into "I push to main and the system refuses to ship anything broken." If `11` is *what* an onboarding looks like, this doc is *the safety net underneath every deploy that supports one*.
+> **By the end of this doc you will know:** what CI/CD actually means. The GitHub Actions vocabulary you need before the YAML stops looking like alphabet soup. A complete `.github/workflows/release.yml` walked piece by piece. How to build for Windows, Mac, and Linux in one run using matrix builds. How to sign Windows binaries in CI without shipping a USB token. How to notarize Mac binaries in CI. How to publish the auto-updater manifest atomically. How to roll back fast when something does ship broken. Eight bug/fix pairs.
 
-The most valuable artifacts are §3 (the workflow YAML) and §6 (the validator script). If anything has to be cut for length, those two stay.
+This is the doc that turns "I push to main and hope the build works on my laptop later" into "I push to main and 30 minutes later signed installers are available for download." If 12 is *how* a release happens, this is *the safety net underneath every release.*
+
+The most valuable artifact is §4 (the workflow YAML). If anything has to be cut for length, that stays.
 
 ---
 
@@ -16,511 +16,449 @@ Two phrases jammed together that everyone uses interchangeably. Let's separate t
 
 **CI — Continuous Integration.** Every push triggers an automated server to pull your code, install dependencies, run your type checker, run tests, run any other checks, and report pass/fail. The point: catch broken code at push time instead of "9 a.m. Monday from a customer email."
 
-**CD — Continuous Deployment.** When CI passes on the right branch, that same server takes the just-built artifact and ships it to your hosting platform — Cloudflare Pages and Workers in our case. No human runs `wrangler deploy` from a laptop. The pipeline does.
+**CD — Continuous Deployment.** When CI passes on the right branch, that same server takes the just-built artifact and ships it to wherever it goes — for us, that's the update server (the static-file host hosting installers and `latest.json`). No human runs `tauri build` from a laptop. The pipeline does.
 
-Stitched together: **CI/CD is a robot that re-checks every change and ships only the changes that pass.** The robot is GitHub Actions. The checks are pnpm scripts. The ship step is the wrangler CLI. The whole thing lives in one YAML file.
+Stitched together: **CI/CD is a robot that re-checks every change and ships only the changes that pass.** The robot is GitHub Actions. The checks are npm scripts. The build/sign step is `tauri-cli` plus the OS signing tools. The publish step is "upload these files to the right URL."
 
-A solo dev needs this *more* than a five-person team does. A team has at least one extra pair of eyes on a PR. You don't. The pipeline is your second pair of eyes — and unlike a teammate, it never gets tired, never deploys at 11 p.m. while distracted, and never forgets to run the tenant validator. The foot-guns this catches — a `tenants/acme.json` typo, a TypeScript error Vite silently transpiled past, a `node_modules` mismatch between laptop and production — are exactly the ones a solo dev is most exposed to.
-
----
-
-## 2. Vocabulary primer
-
-GitHub Actions has its own dialect. Define every term once, then nothing in §3 surprises you.
-
-- **Workflow** — a YAML file in `.github/workflows/`. GitHub finds it automatically; no registration step. One repo can have many workflow files. We have one: `deploy.yml`.
-- **Trigger** (`on:` in YAML) — the event that starts a workflow running. Examples: a push to `main`, a pull request opened, a manual button click. Without a trigger, the workflow never runs.
-- **Job** — a named group of steps that runs on one machine, top to bottom, stopping on the first failure. A workflow can have multiple jobs that run in parallel; we have one job called `ci`.
-- **Step** — one thing the job does. Either a shell command (`run: pnpm test`) or a pre-built reusable unit (`uses: actions/checkout@v4`). Steps inside a job share a working directory and environment variables.
-- **Runner** — the actual virtual machine the job runs on. We use `ubuntu-latest`, which is a fresh Ubuntu VM that GitHub spins up for the job and throws away when the job finishes. Every run starts from a clean slate.
-- **Action** — a reusable, versioned, named step published on the GitHub Marketplace. Referenced like `actions/checkout@v4`. Think of it as an npm package for CI steps. The `@v4` is the version pin, exactly like a semver tag.
-- **Secret** — an encrypted value stored in your repo's Settings page. Injected into a step at runtime as an environment variable. Never appears in a log; if it does try to appear, GitHub replaces it with `***` automatically. We use two: `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
-- **Gate** — a step whose job is to fail the run if a condition isn't met. Type-checking is a gate. Tenant validation is a gate. Tests are a gate. Gates run *before* the build and deploy steps so a failure stops the deploy.
-- **Preview deploy** — a deployment to a temporary, isolated URL, separate from production, generated for a pull request. Lets you click around the change in a real browser before merging. Cloudflare Pages creates one automatically when you call `wrangler pages deploy` with a non-`main` branch flag.
-- **Rollback** — undoing a deploy. Either by reverting the offending commit (slow, safe, re-runs all gates) or by telling Cloudflare to re-serve a previous deployment (fast, skips gates — emergency only).
-- **Frozen lockfile** — telling pnpm "install exactly what `pnpm-lock.yaml` says, do not upgrade anything, fail if the lockfile is out of date." The flag is `--frozen-lockfile`. Without it, CI can silently install a newer version of a transitive dependency than the one on your laptop, and your "tested locally" changes don't match what shipped.
-
-That's the whole dialect. Eleven words. Now the YAML reads like English.
+A solo dev needs this *more* than a five-person team does. A team has at least one extra pair of eyes on a PR. You don't. The pipeline is your second pair of eyes — and unlike a teammate, it never gets tired, never deploys at 11 p.m. while distracted, and never forgets to run the tenant validator.
 
 ---
 
-## 3. The full workflow YAML, line by line
+## 2. The GitHub Actions vocabulary
 
-This is the artifact. One file, `.github/workflows/deploy.yml`, runs both PR previews and production deploys. Drop it in, fill in the two secrets, push.
+Eleven terms you'll see in YAML. Definitions first; we'll use them in §4.
+
+- **Workflow** — a YAML file in `.github/workflows/`. One workflow per file. The whole thing runs in response to an event.
+- **Event / trigger** — what fires a workflow. `on: push` runs on every push. `on: pull_request` on every PR. `on: workflow_dispatch` lets you start it manually from the UI.
+- **Job** — a unit of work that runs on a fresh runner. Jobs in a workflow can run in parallel by default; you make them sequential with `needs:`.
+- **Runner** — the virtual machine the job runs on. `ubuntu-latest`, `macos-latest`, `windows-latest`. GitHub provides them.
+- **Step** — one command (or one action invocation) inside a job. Steps run sequentially.
+- **Action** — a reusable script someone else (or you) wrote. `actions/checkout@v4` checks out your code. `actions/setup-node@v4` installs Node.
+- **Matrix** — a way to run the same job multiple times with different inputs. We use it to run "build" on three OSes simultaneously.
+- **Artifact** — a file produced by a job that gets uploaded for other jobs (or you) to download later.
+- **Secret** — a key/value stored in your repo settings, available to jobs as `${{ secrets.NAME }}`. Never appears in logs. We use these for signing certs, Apple credentials, update-server credentials.
+- **Environment** — a named context with its own secrets and approval rules. You might have a `production` environment that requires manual approval before deploying.
+- **`needs:`** — a way to say "this job depends on that job finishing first."
+
+---
+
+## 3. The release model
+
+For our project, what triggers a release?
+
+There are two reasonable patterns:
+
+### 3.1 Tag-driven (recommended)
+
+Pushing a Git tag like `v1.2.3` triggers a release workflow that builds + signs + publishes installers for that version. Day-to-day pushes only run CI checks (validate, type-check, test); they don't build installers.
+
+**Pros.**
+- Releases are explicit. No accident-of-a-merge gets shipped.
+- The tag *is* the release version. Easy to roll back ("revert the tag," more or less).
+- Lighter CI on every push (no expensive build runs).
+
+**Cons.**
+- One extra step (push tag).
+
+### 3.2 Main-branch-driven
+
+Every push to `main` builds + signs + publishes. Version comes from `package.json` / `tauri.conf.json`.
+
+**Pros.**
+- Zero ceremony.
+
+**Cons.**
+- Every merge produces a release. If you forget to bump the version, the auto-updater doesn't see a new version (or you get duplicate releases).
+- Easy to accidentally ship in-progress work.
+
+**Recommendation: tag-driven.** A `release: ...` PR that bumps the version + opens a tag is the cleanest pattern.
+
+---
+
+## 4. The full workflow YAML
+
+Here's a complete, working `.github/workflows/release.yml`. Pasted as-is, then walked piece by piece.
 
 ```yaml
-name: CI / Deploy
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags:
+      - 'v*'
 
 jobs:
   ci:
-    name: Type-check, Validate, Test, Build, Deploy
+    name: Pre-release checks
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run validate:tenants
+      - run: npm run typecheck
+      - run: npm test
 
+  build:
+    name: Build ${{ matrix.os }}
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: PowerFab.Dashboard_*.msi
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: PowerFab.Dashboard_*.dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: PowerFab.Dashboard_*.dmg
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: powerfab-dashboard_*.AppImage
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: pnpm
+          node-version: '20'
+          cache: 'npm'
 
-      - uses: pnpm/action-setup@v3
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          version: 9
+          targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v4
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - run: npm ci
+
+      - name: Build the Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY_PASSWORD }}
+          # macOS signing/notarization
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows signing (Azure Key Vault, see §6)
+          AZURE_KEY_VAULT_URI: ${{ secrets.AZURE_KEY_VAULT_URI }}
+          AZURE_KEY_VAULT_CLIENT_ID: ${{ secrets.AZURE_KEY_VAULT_CLIENT_ID }}
+          AZURE_KEY_VAULT_CLIENT_SECRET: ${{ secrets.AZURE_KEY_VAULT_CLIENT_SECRET }}
+          AZURE_KEY_VAULT_TENANT_ID: ${{ secrets.AZURE_KEY_VAULT_TENANT_ID }}
+          AZURE_KEY_VAULT_CERT_NAME: ${{ secrets.AZURE_KEY_VAULT_CERT_NAME }}
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
+          name: installer-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/${{ matrix.artifact }}
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
 
-      - run: pnpm install --frozen-lockfile
+  publish:
+    name: Publish to update server
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
 
-      - run: pnpm typecheck
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
 
-      - run: pnpm validate:tenants
+      - name: Configure AWS / S3 credentials (or R2)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.UPDATES_R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.UPDATES_R2_SECRET_ACCESS_KEY }}
+          aws-region: auto
 
-      - run: pnpm test
+      - name: Upload installers to update server
+        run: |
+          aws s3 cp artifacts/ s3://updates-dashboard/${{ github.ref_name }}/ \
+            --recursive \
+            --endpoint-url ${{ secrets.UPDATES_R2_ENDPOINT_URL }}
 
-      - run: pnpm build
+      - name: Build latest.json manifest
+        run: node scripts/build-update-manifest.mjs ${{ github.ref_name }} > latest.json
 
-      - if: github.event_name == 'pull_request'
-        run: pnpm wrangler pages deploy dist --project-name powerfab-dashboard --branch preview
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: pnpm wrangler pages deploy dist --project-name powerfab-dashboard --branch main
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Publish latest.json (atomic swap)
+        run: |
+          aws s3 cp latest.json s3://updates-dashboard/latest.json.new \
+            --endpoint-url ${{ secrets.UPDATES_R2_ENDPOINT_URL }}
+          aws s3 mv s3://updates-dashboard/latest.json.new s3://updates-dashboard/latest.json \
+            --endpoint-url ${{ secrets.UPDATES_R2_ENDPOINT_URL }}
 ```
 
-Now, line by line.
+Now the walk-through.
 
-### 3.1 Top matter and triggers
+### 4.1 `on: push: tags: 'v*'`
 
-- `name: CI / Deploy` — the human-readable name shown in the Actions tab. Cosmetic.
-- `on:` — opens the trigger block. Answers "when does this run?"
-- `push: branches: [main]` — run on a push to `main`. The production deploy path.
-- `pull_request:` (no qualifier) — run on any pull request, opened, synchronized, or reopened. The preview deploy path.
+The whole workflow only fires when you push a tag starting with `v`. Normal pushes to `main` don't trigger it. (You'd have a separate, lighter workflow for PR checks; I'm focusing on the release one here.)
 
-Two triggers, one workflow. The job body uses `if:` conditions to branch between preview and production — same checks, different deploy command.
+### 4.2 The `ci` job
 
-### 3.2 The job header
+Runs once, on Linux, before any expensive build. Three gates:
 
-- `jobs:` — opens the jobs block. A workflow can declare many jobs in parallel.
-- `ci:` — the job's machine-readable id.
-- `name:` — human-readable name shown in the UI.
-- `runs-on: ubuntu-latest` — pick the runner. A fresh Ubuntu VM, reset every run.
-- `steps:` — opens the step list. Steps run top to bottom; the first non-zero exit fails the job and skips the rest.
+- **`npm run validate:tenants`** — the Zod validator from doc 02 §8. A typo in any `tenants/*.json` fails the build *before* the expensive multi-OS Tauri compile starts. Saves 20 minutes of CI time and surfaces the error fast.
+- **`npm run typecheck`** — strict `tsc --noEmit`. A type error fails the build.
+- **`npm test`** — unit tests. Whatever you have.
 
-### 3.3 The setup steps (1–4)
+### 4.3 The `build` job — matrix
 
-The first four steps are pure plumbing — Node, pnpm, and the dependency cache.
+The matrix runs **four parallel jobs**: Windows x64, Mac arm64, Mac x64, Linux x64. Each job is independent. `fail-fast: false` means if Linux fails, Windows and Mac still complete (so you can see all the failures, not just the first).
 
-```yaml
-- uses: actions/checkout@v4
-```
+`include:` lets you specify per-matrix-cell values — the target triple, the OS, the artifact glob pattern.
 
-GitHub's official action that clones your repo into the runner at the exact commit that triggered the run. Without it, the runner is a blank VM with no code. `@v4` is the major version pin — frozen against upstream changes.
+`runs-on: ${{ matrix.os }}` is the magic line: it picks the OS based on the matrix entry. Windows builds run on `windows-latest`, Mac on `macos-latest`, etc.
 
-```yaml
-- uses: actions/setup-node@v4
-  with:
-    node-version: 20
-    cache: pnpm
-```
+### 4.4 Installing system deps
 
-Installs Node.js (LTS, version 20). `cache: pnpm` is a built-in shortcut that wires up cache hooks for pnpm's store. Without it, every run downloads every dependency cold.
+Tauri needs system libraries on Linux (WebKitGTK and friends) that aren't pre-installed on `ubuntu-latest`. The conditional `if: matrix.os == 'ubuntu-latest'` step installs them. Adds ~30 seconds.
 
-```yaml
-- uses: pnpm/action-setup@v3
-  with:
-    version: 9
-```
+Windows and macOS runners have everything we need pre-installed.
 
-Installs pnpm itself, pinned to major 9. Node ships with npm; pnpm has to be added explicitly.
+### 4.5 The build step + secrets
 
-```yaml
-- uses: actions/cache@v4
-  with:
-    path: ~/.pnpm-store
-    key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-    restore-keys: ${{ runner.os }}-pnpm-
-```
+`tauri build --target <triple>` produces installers and (if updater is configured) `.sig` files. The environment variables pass through all the signing material.
 
-The actual cache step:
+Notice we never inline a secret in the YAML — it's always `${{ secrets.NAME }}`. GitHub redacts these from logs automatically.
 
-- `path: ~/.pnpm-store` — what to cache. pnpm's content-addressed package store.
-- `key:` — the lookup key. Three parts joined with hyphens: the runner's OS, the literal `pnpm`, and a hash of every `pnpm-lock.yaml` in the repo. Same lockfile = same key = instant hit. Different lockfile = miss = fresh download.
-- `restore-keys:` — fallback prefixes on cache miss. If the new key misses, GitHub warm-starts from the most recent `Linux-pnpm-...` cache, and `pnpm install` only downloads the deltas.
+### 4.6 The `publish` job
 
-The `${{ ... }}` syntax is GitHub Actions' expression language. `runner.os` and `hashFiles(...)` are built-in functions that evaluate at runtime.
+Runs after all four `build` jobs succeed. Downloads every artifact, uploads to the update server, builds and publishes `latest.json`.
 
-### 3.4 The install step (5)
+**`environment: production`** enables manual approval gates. You can require a click in the GitHub UI before this job actually runs — useful if you want a final "yes, ship this" moment.
 
-```yaml
-- run: pnpm install --frozen-lockfile
-```
+### 4.7 The atomic manifest swap
 
-A `run:` step is a shell command. This one tells pnpm: install exactly what `pnpm-lock.yaml` says, and **fail if the lockfile doesn't match `package.json`**.
+Two-step publish for `latest.json`:
 
-Without the flag, CI can silently fix up a stale lockfile by upgrading transitive deps. Your laptop's `node_modules` and the runner's diverge. You tested version A; production ships version B. With the flag, the run fails fast with "lockfile is out of date." Annoying when it triggers; saves you from bugs that are almost impossible to reproduce.
+1. Upload to `latest.json.new`.
+2. Atomically rename to `latest.json`.
 
-### 3.5 The four gates (steps 6–9)
-
-These are the checks that have to pass before any deploy. Order matters.
-
-```yaml
-- run: pnpm typecheck
-```
-
-Runs `tsc --noEmit` (configured in `package.json`'s `scripts.typecheck`). `--noEmit` means "type-check only; don't write output files." Vite — the bundler — does *not* type-check. It happily transpiles invalid TypeScript into runnable JS. Without this step, type errors ship to production as runtime crashes. Putting `tsc` here, before the build, is what makes TypeScript actually safe.
-
-```yaml
-- run: pnpm validate:tenants
-```
-
-Runs the script we walk in §6. Loads every `tenants/<slug>.json`, parses each with the Zod `TenantConfig` schema (defined in `02-config.md`), and exits non-zero if any file fails. **This is the single most PowerFab-specific line in the whole pipeline.** §9 explains why.
-
-```yaml
-- run: pnpm test
-```
-
-Vitest in run mode. Exits non-zero on any failure. Standard.
-
-```yaml
-- run: pnpm build
-```
-
-`vite build`. Output lands in `dist/`. This is the artifact the deploy step uploads.
-
-The crucial detail: build comes *after* typecheck, validate, and test. If any of those three fails, the job stops, the build never runs, the deploy never runs. There is no "build despite errors" path. Gate ordering is enforced by step ordering, not by documentation.
-
-### 3.6 The conditional deploy steps (10a, 10b)
-
-```yaml
-- if: github.event_name == 'pull_request'
-  run: pnpm wrangler pages deploy dist --project-name powerfab-dashboard --branch preview
-  env:
-    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-```
-
-`if: github.event_name == 'pull_request'` — run only when triggered by a pull request. `github.event_name` is a built-in context variable holding the trigger name.
-
-Walking the wrangler invocation:
-
-- `pnpm wrangler` — invokes the wrangler CLI installed as a dev dependency.
-- `pages deploy dist` — the Pages deploy subcommand; `dist` is the directory of static files (the Vite output).
-- `--project-name powerfab-dashboard` — names the Cloudflare Pages project. Has to match a project you've already created in the Cloudflare dashboard. Pick the name once; the production URL is keyed on it.
-- `--branch preview` — anything that isn't `main` becomes a preview-class deploy, with its own auto-generated subdomain on Cloudflare's preview hosting.
-
-The `env:` block scopes two variables to *this step only*. `${{ secrets.CLOUDFLARE_API_TOKEN }}` pulls the encrypted value from repo secrets and decrypts it into the runner just for this step. Wrangler reads `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from env by convention. After the step ends, the variable is gone — secrets aren't global on the runner, so a different step's `printenv` wouldn't see them. Smaller blast radius.
-
-```yaml
-- if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-  run: pnpm wrangler pages deploy dist --project-name powerfab-dashboard --branch main
-  env:
-    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-```
-
-The production twin. Runs only when the trigger was a push *and* the branch is `main`. `github.ref` for a push is the full git ref (`refs/heads/main`). `&&` requires both conditions.
-
-The wrangler call is identical except `--branch main`, which Cloudflare interprets as "production deploy."
-
-You might be wondering why this isn't one clever line with `--branch ${{ github.head_ref }}`. The answer: the `if:` split is more explicit and harder to misread at 10 p.m. Two named paths beat one expression, especially when one path ships to production.
+Why? Because if you uploaded directly to `latest.json` and the upload was interrupted halfway, customer apps polling at that moment could see a half-written manifest, fail to parse it, and silently stop updating. The atomic swap means `latest.json` is always either the old version or the new version — never a torn write.
 
 ---
 
-## 4. The pipeline as an ASCII diagram
+## 5. Signing Windows binaries in CI (the Azure Key Vault dance)
 
-Same workflow, drawn as a flow. Reading top to bottom corresponds to running steps top to bottom.
+Doc 12 §5.1 said EV certs come on a USB hardware token. You can't plug a token into GitHub's runners. So how do you sign in CI?
 
-```
-git push to main / PR opened or updated
-                |
-                v
-        [actions/checkout@v4]
-                |
-                v
-        [setup-node + pnpm + cache]
-                |
-                v
-        [pnpm install --frozen-lockfile]
-                |
-                v
-        [pnpm typecheck]  ----FAIL----> job stops, deploy blocked
-                |
-                v
-        [pnpm validate:tenants]  ----FAIL----> job stops, deploy blocked
-                |
-                v
-        [pnpm test]  ----FAIL----> job stops, deploy blocked
-                |
-                v
-        [pnpm build]
-                |
-                v
-        [wrangler pages deploy]
-                |
-         _______|_______
-        |               |
-        v               v
-   preview URL     production URL
-   (PR only)       (push to main only)
-```
+The standard answer is **Azure Key Vault** with a hardware-backed key. Process:
 
-The shape to internalize: the four gates are the chokepoint. Anything broken hits one of those four blocks. The deploy only runs if the chokepoint clears.
+1. Buy an EV code-signing cert from a CA that supports Azure Key Vault key generation (e.g., SSL.com, Sectigo).
+2. During issuance, the CA generates the private key inside Azure Key Vault (you don't get a physical token).
+3. You install **AzureSignTool** in your build pipeline — a `signtool`-replacement that signs by calling Azure Key Vault to use the key remotely.
+4. Tauri's `signCommand` in `tauri.conf.json` calls AzureSignTool with the right flags.
+
+The Azure Key Vault setup is fiddly the first time. Allow a day. The advantages over a USB token:
+
+- Works in CI.
+- Multiple people can be authorized to sign without sharing a physical token.
+- Audit trail of every signing operation.
+- Can't be physically lost.
+
+For Mac, no such issue — you just keep the signing cert in GitHub Secrets (as a base64-encoded `.p12` file with a password). The workflow `keychains` actions decode it into a temporary keychain at the start of the build.
+
+Linux: still no signing.
 
 ---
 
-## 5. Branch → environment mapping
+## 6. Building the manifest
 
-Three paths, one workflow file.
+`scripts/build-update-manifest.mjs` produces the `latest.json` from the artifacts in the publish job. Sketch:
 
-| Branch | Trigger event | Deploy target | Wrangler flag |
-|---|---|---|---|
-| any feature branch | `pull_request` | Preview (per-PR URL) | `--branch preview` |
-| `main` | `push` | Production | `--branch main` |
-| `staging` (optional) | `push` | Staging | `--branch staging` |
+```js
+// scripts/build-update-manifest.mjs
+import fs from 'fs';
+import path from 'path';
 
-We don't ship a `staging` branch in the MVP — preview-per-PR plus production is enough. If you add staging later, it's another `if:` block on the deploy step, same shape as the production one, with its own branch flag.
+const version = process.argv[2].replace(/^v/, '');
+const base = `https://updates.dashboard.example.com/v${version}`;
 
-For the Worker (the Hono backend, separate from Pages), `wrangler.toml` defines named environments per `[env.NAME]` block — see `12-local-dev-and-deploy.md` for the toml setup. The CI workflow then passes `--env preview` or `--env production` to `wrangler deploy` to pick the right one. The branch-to-env mapping in CI must match a section name that actually exists in `wrangler.toml`, or wrangler silently falls back to the top-level config (pitfall #4 in §10).
-
----
-
-## 6. The `validate-tenants.ts` script, line by line
-
-Why this exists, in one sentence: a typo in `tenants/acme.json` will pass `JSON.parse`, pass `vite build`, pass `wrangler pages deploy`, and break Acme at runtime when the Worker tries to read a missing field. The Zod schema is the contract; this script enforces it before the deploy runs.
-
-The whole script, ~18 lines:
-
-```ts
-// scripts/validate-tenants.ts
-import { glob } from "glob";
-import { readFileSync } from "fs";
-import { TenantConfig } from "../src/schemas/tenant";
-
-const files = glob.sync("tenants/*.json");
-let failed = false;
-
-for (const file of files) {
-  const raw = JSON.parse(readFileSync(file, "utf-8"));
-  const result = TenantConfig.safeParse(raw);
-  if (!result.success) {
-    console.error(`INVALID: ${file}`);
-    console.error(result.error.format());
-    failed = true;
-  } else {
-    console.log(`OK: ${file}`);
-  }
+function readSig(fname) {
+  // .sig files live next to their installers
+  return fs.readFileSync(path.join('artifacts', fname), 'utf8').trim();
 }
 
-if (failed) process.exit(1);
+const manifest = {
+  version,
+  notes: process.env.RELEASE_NOTES || '',
+  pub_date: new Date().toISOString(),
+  platforms: {
+    'windows-x86_64': {
+      signature: readSig('installer-x86_64-pc-windows-msvc/PowerFab.Dashboard_*.msi.sig'),
+      url: `${base}/PowerFab.Dashboard_${version}_x64_en-US.msi`,
+    },
+    'darwin-aarch64': {
+      signature: readSig('installer-aarch64-apple-darwin/PowerFab.Dashboard_*.dmg.sig'),
+      url: `${base}/PowerFab.Dashboard_${version}_aarch64.dmg`,
+    },
+    'darwin-x86_64': {
+      signature: readSig('installer-x86_64-apple-darwin/PowerFab.Dashboard_*.dmg.sig'),
+      url: `${base}/PowerFab.Dashboard_${version}_x64.dmg`,
+    },
+    'linux-x86_64': {
+      signature: readSig('installer-x86_64-unknown-linux-gnu/powerfab-dashboard_*.AppImage.sig'),
+      url: `${base}/powerfab-dashboard_${version}_amd64.AppImage`,
+    },
+  },
+};
+
+console.log(JSON.stringify(manifest, null, 2));
 ```
 
-Walking it:
+You'd want to refine the glob patterns to handle the real artifact names, but this is the shape.
 
-- `import { glob } from "glob";` — shell-style filename matching in Node. The script discovers tenant files; it doesn't hard-code their names.
-- `import { readFileSync } from "fs";` — Node's sync file reader. Fine for a short-lived CI script.
-- `import { TenantConfig } from "../src/schemas/tenant";` — the Zod schema from doc 02. **Single source of truth.** The Worker uses the same schema at request time. Same parser, two callers, no drift.
-- `const files = glob.sync("tenants/*.json");` — every `.json` directly under `tenants/`. Returns relative paths.
-- `let failed = false;` — accumulator. Validate every file before exiting, not bail on the first. If three files are bad, you want all three failures in one run.
-- `for (const file of files) {` — loop the file paths.
-- `const raw = JSON.parse(readFileSync(file, "utf-8"));` — read UTF-8, parse as JSON. This catches purely malformed JSON (a stray comma, an unquoted key); if it throws, the script fails CI.
-- `const result = TenantConfig.safeParse(raw);` — hand to Zod. `safeParse` (vs `parse`) returns a result object with `success: boolean` instead of throwing, so we can keep going on failure.
-- `if (!result.success) { ... } else { ... }` — branch on outcome.
-- `console.error(`INVALID: ${file}`);` — flag the file on stderr.
-- `console.error(result.error.format());` — Zod's `.format()` returns a structured tree of errors with field paths. Tells you exactly which field is wrong.
-- `failed = true;` — set the flag; keep checking.
-- `console.log(`OK: ${file}`);` — happy-path log to stdout. Confirms in CI that all files passed.
-- `if (failed) process.exit(1);` — if any file failed, exit non-zero.
+---
 
-Why is `process.exit(1)` the part that "fails the step"? GitHub Actions decides pass/fail per step by reading the exit code of the process. **Exit 0 = success. Non-zero = failure. The job stops on the first failed step.** Any script that exits non-zero is a gate.
+## 7. Rolling back fast
 
-Add to `package.json`:
+Something shipped broken. How do you roll back?
 
-```json
-{
-  "scripts": {
-    "validate:tenants": "tsx scripts/validate-tenants.ts"
-  }
-}
+The auto-updater is the constraint: customer apps will refuse to "downgrade" to an older version automatically. So "rollback" really means "publish a *new* version that's the same as the old one."
+
+The fast steps:
+
+1. Identify the last known good version (e.g., `v1.2.2`).
+2. Push a tag `v1.2.4` from the `v1.2.2` commit. CI builds new installers from that commit, with version `1.2.4`.
+3. The new manifest points at `v1.2.4`.
+4. Customers' auto-updaters poll, see the "new" version, install. Effectively: a rollback wearing the disguise of a forward update.
+
+Time-to-rollback: ~30 minutes (build + sign + publish) plus the auto-updater poll cadence (~24 hours worst case).
+
+To speed this up:
+
+- Keep the previous installers on the update server. Don't delete them; they're tiny.
+- For really fast rollback, have an "emergency hotfix" workflow with manual approval that skips matrix and only rebuilds one OS at a time.
+- If a customer is on fire, hand them a direct download link to the previous installer (they reinstall manually, immediate).
+
+---
+
+## 8. The PR-check workflow (lighter than the release one)
+
+You also want CI on every PR. A small workflow `.github/workflows/pr-check.yml`:
+
+```yaml
+name: PR check
+on: [pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: npm run validate:tenants
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run lint
 ```
 
-`tsx` runs TypeScript without a separate compile step. The CI step (`pnpm validate:tenants`) just calls this entry.
-
-### 6.1 Why this has to be a CI gate, not a dev habit
-
-Running `pnpm validate:tenants` locally before every commit is exactly the discipline a solo dev forgets at 11 p.m. on Sunday. A local-only check is hope, not safety.
-
-CI inverts the default: the validator runs *every* push, regardless of what you remembered. Cost: one second of runner time. Benefit: a broken tenant config can never reach Cloudflare. For PowerFab — where one bad tenant file can break one customer or crash the Worker for *all* tenants on next deploy (pitfall #2 in `11`) — that asymmetry is overwhelmingly worth it.
+That's plenty for PR-time. The expensive multi-OS Tauri build only happens on tag push.
 
 ---
 
-## 7. Secrets — how the API token reaches wrangler safely
+## 9. Eight bug/fix pairs
 
-Wrangler needs a Cloudflare API token. We never want it in the repo, a log, or on a laptop. GitHub Actions secrets exist for this.
+### 9.1 Build fails on Windows with "MSBuild not found"
 
-**Storage.** Repo → Settings → Secrets and variables → Actions → New repository secret. Add two: `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. GitHub encrypts with libsodium before writing to disk. No UI to read them back; you can rotate or delete, not view.
+Newer Windows runners use a different default Visual Studio version.
 
-**Reference in YAML.** `${{ secrets.CLOUDFLARE_API_TOKEN }}`. The runtime substitutes the decrypted value at the call site. Use only inside `env:` blocks scoped to the deploy steps (§3.6) — never as a global env, never echoed.
+**Fix:** Add an explicit `microsoft/setup-msbuild` action, or pin to a specific runner version (`windows-2022`).
 
-**Log masking.** GitHub maintains a list of secret values per run. Any matching string in stdout or stderr gets replaced with `***` before the log persists. Not bulletproof — base64-encoded or line-split values can slip through — but it covers the common case. The rule: never `echo` a secret, never `set-output` a secret (pitfall #7).
+### 9.2 Mac build hangs in notarization
 
-**Least-privilege Cloudflare token.** When creating the token in Cloudflare's dashboard, *don't* use the global API key (account-wide, edit-everything). Create a custom token with only:
+`tauri build` submitted the binary but didn't wait long enough.
 
-- `Cloudflare Pages: Edit` — for `wrangler pages deploy`.
-- `Workers Scripts: Edit` — for `wrangler deploy` of the Hono backend.
+**Fix:** Tauri waits by default; if you're customizing, ensure `xcrun notarytool ... --wait` is used.
 
-No `Account: Administrator`, no `Zone: Edit`, no DNS or billing scope. If the token leaks despite the precautions, the blast radius is "attacker can deploy to your project" — not "attacker can rotate your DNS, change billing, or read your KV data." Cloudflare-side scoping is the real security layer; GitHub masking is the seatbelt.
+### 9.3 Mac signing fails with "no identity found"
 
----
+The keychain doesn't have your Developer ID cert because we never decoded it.
 
-## 8. Preview deploys and KV namespace isolation
+**Fix:** Add a step before build that decodes the base64 `.p12` from secrets into a temporary keychain. There are pre-built actions for this (e.g., `apple-actions/import-codesign-certs`).
 
-Every PR gets a deploy. Cloudflare Pages assigns a unique, hash-based subdomain on its preview hosting and serves the build there. The URL appears in the Actions log and in the Cloudflare dashboard. Click; see your branch live.
+### 9.4 Linux AppImage missing libraries
 
-The dangerous half: which KV namespace is that preview bound to?
+Not all WebKitGTK deps are installed.
 
-**Default behavior.** A preview deploy inherits production's KV namespace bindings. Preview code (possibly unreviewed) reads and writes the *real production* `TENANT_CONFIG` namespace. One bad write corrupts every tenant's config.
+**Fix:** Use the exact apt list from doc 12 §2.1. Re-check the Tauri Linux deps page for changes.
 
-**Fix — separate preview namespace.** In `wrangler.toml`, override the binding inside `[env.preview]` so previews point at a throwaway namespace.
+### 9.5 Auto-updater fails for users on the new version
 
-```toml
-[[kv_namespaces]]
-binding = "TENANT_CONFIG"
-id = "PRODUCTION_NAMESPACE_ID"
+`latest.json` is correct, installers are correct, but updates don't apply.
 
-[env.preview]
-[[env.preview.kv_namespaces]]
-binding = "TENANT_CONFIG"
-id = "PREVIEW_NAMESPACE_ID"
-```
+**Fix:** Check that the `signature` field is the **raw contents** of the `.sig` file, not base64-of-base64 or otherwise re-encoded. A common mistake when scripts read the file in the wrong mode.
 
-The top-level binding is production. The `[env.preview]` block defines a *different* namespace ID for the same binding name. The Worker code is identical; the data layer is isolated. A preview that goes haywire writes garbage to a namespace nobody reads in production.
+### 9.6 Build is slow (>30 minutes)
 
-This is the highest-impact isolation step in the whole CI setup. Skip it and you've got a footgun pointed at every customer's config every time you open a PR. (See `12-local-dev-and-deploy.md` for the full `wrangler.toml` walk.)
+Cargo's incremental compile state isn't shared between runs.
 
----
+**Fix:** Add `Swatinem/rust-cache@v2`. Caches the `target/` directory across runs. Brings 20-minute Rust builds down to 2–3 minutes after warmup.
 
-## 9. Why we use `wrangler` from CI instead of Cloudflare's git integration
+### 9.7 Secrets accidentally appearing in logs
 
-Cloudflare offers a "git integration" — connect a GitHub repo, Cloudflare watches for pushes and auto-deploys without any Actions workflow. Two-click, zero YAML.
+You logged an env var.
 
-Wrong choice for this stack, because **the git integration bypasses every CI gate.** It builds and ships. It doesn't run `pnpm typecheck`, `pnpm validate:tenants`, or `pnpm test`. A push with a typoed tenant file deploys, breaks a customer, and you find out via email.
+**Fix:** GitHub auto-redacts known secrets. But if you `echo` a value into something or use it in a filename, it can leak. Audit any step that touches a secret.
 
-Running `wrangler pages deploy` from inside Actions inverts the architecture: Actions controls the gates, the gates run *first*, the deploy is a consequence of passing. The workflow YAML — checked in, version-controlled, code-reviewable — is the source of truth.
+### 9.8 The publish job ran on a half-built artifact
 
-Cost: ~30 lines of YAML and ~18 lines of validator. Benefit: a malformed tenant config, a TS error, or a broken test cannot reach Cloudflare. For a stack where a broken config silently breaks one customer, the Actions-driven approach is the only correct shape.
+A `build` matrix entry failed but `publish` still tried to download all artifacts.
 
-For the Hono Worker (separate Cloudflare product), `wrangler deploy` from CI is the only path — Cloudflare's git auto-deploy is a Pages-only feature.
+**Fix:** Use `if: success()` on the publish job (which is the default), and consider explicit `needs:` listing each matrix cell so a failure in any one cell halts the publish.
 
 ---
 
-## 10. Pitfalls — bug/fix pairs
+## 10. A 60-second mental model of the whole thing
 
-**1. Echoing a secret.**
-**Bug.** Someone adds `run: echo "Token: $CLOUDFLARE_API_TOKEN"` for debugging. Sometimes masking works (the line shows `Token: ***`); sometimes a subprocess base64s or splits the value and masking misses. Now the token sits in a log forever.
-**Fix.** Never echo a secret in any form. To confirm a secret is set, log its length, not its value. Treat masking as backup, not primary defense.
+You push tag `v1.2.3`. Twenty-five minutes later:
 
-**2. `validate:tenants` omitted from the workflow.**
-**Bug.** You rewrite the workflow, remove the validator step "temporarily," forget to put it back. A PR ships with `tenants/new-customer.json` containing a typo. Build passes, deploy ships, the new customer 404s on first visit.
-**Fix.** Mandatory ordering — install → typecheck → validate:tenants → test → build → deploy — encoded in the YAML, not in a checklist.
+1. CI passed: tenants validated, types check, tests pass.
+2. Three runners spun up in parallel (Windows, Mac×2, Linux). Each compiled Tauri, signed the artifact, uploaded it.
+3. A fourth job pulled all artifacts, uploaded them to the update server under `v1.2.3/`, built `latest.json`, atomically swapped it in.
+4. Customer apps poll `latest.json`, see version `1.2.3`, download, prompt to restart.
+5. Restarts roll out over the next 24 hours.
 
-**3. `pnpm build` before `pnpm typecheck`.**
-**Bug.** "Build is the slow step, run it first to fail faster." Vite transpiles past TS errors; the build succeeds with broken types; production crashes at runtime.
-**Fix.** Typecheck always precedes build. The order isn't about speed; it's about which step catches which class of error.
-
-**4. `--env` flag mismatched with `[env.X]` in `wrangler.toml`.**
-**Bug.** Workflow passes `--env staging`; toml only defines `[env.preview]` and `[env.production]`. Wrangler silently falls back to the *top-level* config — which is production's — and deploys staging code with production bindings.
-**Fix.** The `--env` flag must match an `[env.NAME]` section that actually exists. Silent fallback is the real bug; the mismatch is the trigger.
-
-**5. `compatibility_date` set on the command line, not in `wrangler.toml`.**
-**Bug.** A past `wrangler deploy --compatibility-date 2024-09-23` from a laptop diverges from CI's toml `2024-01-01`. Worker behaves differently in CI deploys than in the manual one.
-**Fix.** Set `compatibility_date` only in `wrangler.toml`. Never on the CLI. The date lives in source control; everyone deploys the same semantics.
-
-**6. Preview deploy bound to production's KV namespace.**
-**Bug.** Default `wrangler.toml`: one `[[kv_namespaces]]`, no `[env.preview]` override. A preview test writes a malformed key. Production tenant resolution fails until you find and delete it.
-**Fix.** The `[env.preview]` KV override from §8. The single most important hardening step.
-
-**7. Secret leaked via `set-output` or `$GITHUB_OUTPUT`.**
-**Bug.** A step computes a value that includes a secret substring and exposes it as a step output. The output escapes the `env:` scope and lands in a log or artifact.
-**Fix.** Secrets travel only via `env:` blocks scoped to the step that needs them. Never as a step output, job output, or artifact.
-
-**8. Auto-merge with an untrusted gate.**
-**Bug.** Auto-merge is on. A PR opens, CI passes (because the same PR disabled the test that would have failed), auto-merges, ships.
-**Fix.** Branch protection on `main` requiring `ci` to pass *and* at least one approving review. For a solo dev, "review by yourself before merging" is weak — but combined with mandatory gates it forces a 30-second pause.
+End to end: code change → in customers' hands ≈ a day, with no manual steps after `git tag && git push --tags`.
 
 ---
 
-## 11. Caching — the small win
+## 11. By the end of this doc you should know
 
-The `actions/cache@v4` step (§3.3) caches `~/.pnpm-store` keyed by `pnpm-lock.yaml`. With a warm cache, `pnpm install` finishes in seconds because every package is already on disk; install is just symlinking.
-
-If Vite's incremental build cache ever matters (rarely, on small frontends), add a parallel cache step keyed on `vite.config.ts` and pointed at `node_modules/.vite`. Don't add it speculatively — premature caching adds complexity for negligible savings on a project this size.
-
----
-
-## 12. Rollback — three ways, two of them dangerous
-
-Something shipped broken. How do you get back to a known-good state?
-
-| Method | Speed | Safe? | When to use |
-|---|---|---|---|
-| Revert commit + push to `main` | 2 minutes (CI re-runs) | Yes — gates re-run on the revert | Default rollback. The slow path is the right path. |
-| `wrangler rollback` | Seconds | No — skips all CI gates | Active incident only |
-| Re-promote a previous deploy from the Cloudflare dashboard | Seconds | No — skips all CI gates | Active incident only |
-
-The honest tradeoff: the fast paths are unsafe because they bypass the gates that exist precisely to keep this kind of mistake out. They're the right tool when a customer is actively broken and you need to stop the bleeding. They're the wrong tool for a leisurely fix.
-
-The discipline: use `wrangler rollback` to triage, then immediately push a real revert commit so `main` reflects what's actually deployed. Otherwise your git history says one thing and production runs another, and the next deploy from `main` will redeploy the broken commit on top of the rollback.
+- What CI/CD actually means and why a solo dev needs it more than a team does.
+- The 11 pieces of GitHub Actions vocabulary.
+- The tag-driven release model (and why it beats push-to-main).
+- A complete `.github/workflows/release.yml` walked line by line.
+- How to sign Windows in CI without a physical USB token (Azure Key Vault).
+- How to sign and notarize Mac in CI.
+- How to build the `latest.json` manifest and publish it atomically.
+- How to roll back quickly when something ships broken.
+- Eight specific build-CI bugs and their fixes.
 
 ---
 
-## 13. What this means for PowerFab specifically
-
-Most gates in §3 are generic — typecheck, test, frozen lockfile — and belong in any TypeScript pipeline. One isn't: `pnpm validate:tenants`.
-
-That gate exists because of PowerFab's specific risk profile:
-
-- **One typo in `tenants/<slug>.json` breaks one customer.** A missing field, a misspelled module name, a bad flag — the Worker loads the malformed config and either crashes on first request or renders an empty dashboard. The customer notices; you don't, until the email arrives.
-- **One *malformed* tenant file can break the Worker for *all* tenants.** If config-loading throws during cold start, every tenant on that data center hits the same error until a fix ships.
-- **You're a solo dev.** No teammate reviews your PRs. The pipeline is the reviewer.
-
-The validate:tenants gate is the cheapest insurance against that failure mode. One step, one second of runner time, and the pipeline refuses to ship a broken config. If every other gate were stripped out, this is the one to keep.
-
-Same logic for the preview-namespace isolation (§8). Without it, every PR is one accidental write away from corrupting production tenant configs. With it, a preview can do whatever it wants to a throwaway namespace; production stays clean. That's a PowerFab-specific guardrail because PowerFab specifically stores load-bearing routing data in KV.
-
-The shape to internalize: a CI/CD pipeline isn't checks-for-the-sake-of-checks. Each gate maps to a real failure mode in your specific stack. For PowerFab, the two most important gates are the ones that protect the tenant config — because that's where your stack is most fragile.
-
----
-
-## 14. By the end of this doc you should know
-
-- What CI and CD mean separately, and why a solo dev needs them more than a team does.
-- The eleven Actions-dialect terms in §2 — workflow, trigger, job, step, runner, action, secret, gate, preview deploy, rollback, frozen lockfile.
-- Every line of the workflow YAML in §3 — why `--frozen-lockfile` matters, why typecheck precedes build, why the deploy is split into two `if:`-guarded variants.
-- Every line of `validate-tenants.ts` in §6, and why `process.exit(1)` is what fails a GitHub Actions step.
-- Why we run `wrangler pages deploy` from inside Actions instead of using Cloudflare's git integration — gates, not convenience.
-- What a preview deploy is and why preview deploys must use a separate KV namespace from production.
-- How the two Cloudflare secrets reach the deploy step without ever appearing in a log, and why the token is scoped to Pages and Workers only.
-- The eight bug/fix pairs in §10, especially #2 (don't drop the validator) and #6 (isolate the preview KV namespace).
-- The three rollback paths and which two are emergency-only.
-- Why validate:tenants protects PowerFab from its single most dangerous failure mode.
-
-If §3 still feels alien, re-read §2 first, then §3 with the vocabulary in mind.
-
----
-
-**Next:** `14-observability.md` — what to log, what to alert on, how to know when a tenant breaks before the customer email arrives. Builds directly on this doc's deploy pipeline (because every deploy is itself an observability event).
+**Next:** [`14-observability-and-cost.md`](./14-observability-and-cost.md) — what you actually pay for in the desktop world, and how to know if a deployed app is failing somewhere without poking at customer machines.

@@ -1,555 +1,522 @@
-# 01 — Tenant Resolution: How the URL Becomes "This is Acme"
+# 01 — Tenant Resolution: How the App Knows Who It's For
 
-> **Pre-reqs:** Read `00-start-here.md` first if you haven't. You should already know what a tenant, subdomain, Worker, and KV are.
->
-> **What you'll know by the end:** How a request to `acme.app.example.com` ends up with our code knowing "I am serving Acme right now," with the per-tenant config loaded and ready. Every line of code we use is explained.
+> **Prerequisite:** read [`00-start-here.md`](./00-start-here.md). This doc assumes you know what a tenant, a license key, and a Tauri app are.
 
----
-
-## 1. The problem
-
-Imagine 100 different fab shops have signed up. Each one is at their own URL:
-
-- `acme.app.example.com`
-- `bobs-beams.app.example.com`
-- `cora-construction.app.example.com`
-- … and so on for all 100 …
-
-When a request lands on our infrastructure, we need to answer one question before doing *anything* else:
-
-> **Which tenant is this request for?**
-
-Once we know that, we can:
-- Look up that tenant's config (which modules are enabled? which metric overrides?)
-- Reject the request if the subdomain is unknown (no `hacker.app.example.com`)
-- Pass the tenant info into the React app so it knows what to render
-- Pass the tenant info into any data API calls so they return *that tenant's* data
-
-This whole process — figuring out which tenant a request is for and loading their config — is called **tenant resolution**.
+> **By the end of this doc you will know:** what "tenant resolution" means in a desktop app, six different ways to do it (with honest pros/cons of each), our recommended approach and why, and a line-by-line walk-through of the recommended code path — from the user pasting a license key to the app saying "I am Acme."
 
 ---
 
-## 2. Background: how URLs and subdomains actually work
+## 1. What "tenant resolution" means
 
-Quick primer because some of this is non-obvious.
+Tenant resolution is the part of the app that answers the question:
 
-### 2.1 What's in a URL
+> *Which customer is this install for?*
 
-```
-https://acme.app.example.com/some/path?foo=bar
-└─┬─┘   └─────────────┬───────┘└──┬───┘└──┬──┘
- scheme         host (a.k.a.       path   query string
-                "domain name"
-                or "hostname")
-```
+On the web (the old plan), this was easy: read the subdomain. `acme.app.example.com` → tenant is `acme`. The URL itself carried the identity.
 
-The **host** is the part right after `https://` and before the first `/`. In our example: `acme.app.example.com`.
+On the desktop there is no URL. The app is just sitting in `C:\Program Files\Dashboard\dashboard.exe`. There's no `acme` anywhere on disk. So we need a different mechanism for the app to figure out who it's for.
 
-A host has dots in it. Reading from right to left, the parts get more specific:
+That mechanism — whatever we pick — is what tenant resolution means in the new world.
 
-```
-acme   .   app   .   example   .   com
-└──┬─┘     └─┬─┘     └────┬──┘     └─┬─┘
-"acme is   "app is the    "example   ".com is
-a child    main app at     is the    a top-level
-of app"    example.com"    company"   domain"
-```
-
-The leftmost label (in our case `acme`) is what we'll use as the tenant identifier. We call it the **slug** because that's the term web devs use for "URL-safe short identifier."
-
-### 2.2 What the browser sends
-
-When the user types `https://acme.app.example.com/dashboard` and hits Enter, the browser opens a connection to whatever server `acme.app.example.com` resolves to (we'll set that up to be Cloudflare). It sends an HTTP request that looks roughly like this:
-
-```
-GET /dashboard HTTP/1.1
-Host: acme.app.example.com
-Accept: text/html
-... other headers ...
-```
-
-The **`Host` header** is the critical bit. It's how the browser tells the server "I want the version of the site at `acme.app.example.com`" — even though the server might be hosting many different sites.
-
-This is the whole foundation. **Every request includes the host. We extract the leftmost label from the host. That's our tenant slug.** Everything else in this doc is plumbing around that one idea.
-
-### 2.3 Wildcard DNS
-
-Normally to point `acme.app.example.com` at a server, you'd add a DNS record. With 100 tenants, you do not want to add 100 DNS records by hand.
-
-The fix: a **wildcard DNS record**. You add ONE record that says "anything matching `*.app.example.com` should go to Cloudflare" and DNS handles all 100 tenants automatically. New customer? They just work — no DNS change.
-
-Cloudflare lets you do this through their dashboard. It's a single CNAME record. We won't go deeper here; the [Cloudflare docs on wildcard DNS](https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/) explain the setup.
+Tenant resolution always happens **once per install, on first launch**. After that the answer is cached in a local file (or the OS keychain), and every subsequent launch just reads the cached answer. We do not ask the user to prove who they are every single time the app opens — that would be annoying.
 
 ---
 
-## 3. Where to extract the subdomain — three options
+## 2. The six options for tenant resolution
 
-Once a request has landed somewhere, we need to grab `"acme"` out of the host. There are three plausible places to do that, and they have different tradeoffs.
+There is no single "correct" answer here. The right pick depends on three things:
 
-### Option A — In the browser (React reads `window.location.hostname`)
+1. **How many customers do you expect?** 10 vs. 200 changes the math.
+2. **How technical is the customer's IT person?** Some shops have an IT manager who can run an installer with a config file; some have a single owner who needs zero friction.
+3. **How much infrastructure do you want to run?** Some options require us to host a small server; some don't.
 
-The simplest version. The React app boots, reads `window.location.hostname` (a built-in browser property that gives you the host), and grabs the first label.
+I'm going to lay out six options, in roughly increasing order of friction, and at the end recommend one. Skim them all first before judging.
 
-```ts
-// somewhere in main.tsx
-const slug = window.location.hostname.split('.')[0];
-// slug === 'acme' for acme.app.example.com
+### Option A — Per-tenant installer (single-tenant builds)
+
+**How it works.** We build a separate installer for each customer. `acme-dashboard-1.2.3.msi`, `bigshop-dashboard-1.2.3.msi`, etc. Each one has the tenant slug compiled in as a constant — like a `TENANT_ID = "acme"` line in the code, set at build time. The user just runs the installer and the app already knows who it is.
+
+**Pros.**
+- Zero friction for the end user. No code to enter, no login screen.
+- No client-side validation logic. The tenant identity is just *there*.
+- Easy to reason about. You can hand-inspect a build and know which tenant it belongs to.
+
+**Cons.**
+- A new release means recompiling and signing **N installers** (one per customer). At 200 customers, this is many minutes of CI time and 200 signed binaries to host. Manageable, but operationally heavy.
+- A new customer means a new build before they can install. Onboarding is slower.
+- If a user accidentally downloads the wrong installer, they get the wrong tenant. (Mitigated by tenant-specific download URLs.)
+- You're effectively running a single-tenant deployment with multi-tenant code. Defeats some of the "one app many tenants" elegance.
+
+**Good for.** Small numbers of high-value customers (say <20), or environments where you absolutely cannot ask the user to do anything on first launch.
+
+### Option B — Drop-a-config-file activation
+
+**How it works.** Same installer for everyone. After install, the customer's IT person drops a small file — `tenant.json` — into a well-known location next to the app (e.g., `C:\ProgramData\Dashboard\tenant.json`). On launch, the app looks for that file, reads it, and learns who it is. No UI for activation.
+
+**Pros.**
+- One installer for everyone. Build once, ship to all.
+- IT-friendly. IT departments can push the file via Group Policy, Intune, JAMF, or a deployment script.
+- Zero end-user friction. The employee just opens the app and it works.
+
+**Cons.**
+- Requires the customer to have an IT capability — not every fab shop does.
+- The file is on disk in plain view. Anyone with file-system access can edit it and pretend to be another tenant. (For our case, that's mostly a non-issue because the data gateway will reject queries from a tenant it doesn't recognize — but it's not ideal.)
+- If the file is missing on first launch, the app has to know how to recover (show an "ask your IT person for tenant.json" screen).
+
+**Good for.** Mid-size or larger customers who have an IT person and prefer "zero-touch" rollouts to many employees.
+
+### Option C — Offline-signed license key (the recommended approach)
+
+**How it works.** Same installer for everyone. On first launch the app shows a single screen: "Enter your license key." The user pastes a long string like:
+
+```
+eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ0ZW5hbnQiOiJhY21lIiwiZ2F0Z
+XdheV91cmwiOiJodHRwOi8vMTAuMC41LjIwOjgwODAiLCJleHAiOjE3OTk5OTk5OT
+l9.0pXc3K2vWeQZk5L8wQ3p9C7gZ4mE5tH7zJ9...
 ```
 
-**Pros:** Zero infrastructure. Just JavaScript.
+That string is a **JWT** (JSON Web Token) — three base64 chunks separated by dots: `header.payload.signature`. The middle chunk decodes to JSON like:
 
-**Cons:**
-- The unknown-tenant case is bad. If someone hits `hacker.app.example.com`, the server hands them the full React app, and only THEN does the React app realize "wait, who's hacker?" The user sees the app shell flash before getting an error. We've also wasted bandwidth shipping the whole app.
-- The config still has to be fetched somehow after boot — that's a second round trip before anything renders.
-- Server-side rendering (if we ever add it) doesn't have access to `window`.
-
-This pattern is fine for prototypes. We're not using it for production.
-
-### Option B — At the edge (Worker rewrites or rejects)
-
-Cloudflare Workers run *before* Pages serves the static files. We put a Worker in front, it reads the `Host` header, looks up the tenant, and either passes the request through (with config attached) or returns a 404.
-
-```ts
-// pseudocode
-function handle(request) {
-  const host = request.headers.get('host');
-  const slug = host.split('.')[0];
-  const config = lookupTenant(slug);
-  if (!config) return new Response('Unknown tenant', { status: 404 });
-  // pass through to Pages
-  return fetch(request);
+```json
+{
+  "tenant": "acme",
+  "gateway_url": "http://10.0.5.20:8080",
+  "exp": 1799999999
 }
 ```
 
-**Pros:**
-- Authoritative gate at the edge. Unknown tenants get a clean 404 before any app code is shipped.
-- Fast. Workers run in the same Cloudflare data center the user is talking to.
-- The Worker can attach the config to the response, eliminating the second round trip.
+The app has our **public key** baked into its source code. It uses the public key to verify the JWT's signature. If the signature checks out, the app trusts the payload, extracts the tenant slug, saves everything to a local config file, and never asks again. No server call required at any point.
 
-**Cons:**
-- Adds a piece of infrastructure (the Worker) we have to deploy and maintain.
+**Pros.**
+- One installer for everyone. No per-tenant builds.
+- No server required for activation. The verification happens entirely on the user's machine using the public key baked into the app.
+- Tamper-proof. The user can't edit the token to change the tenant slug because they don't have our private key — any change breaks the signature.
+- Expiry is supported (the `exp` field). Stops working after a date.
+- Easy to reissue if a customer loses their key (we just sign a new one).
 
-### Option C — Both: Worker reads + injects, React reads what's injected
+**Cons.**
+- The end user has to paste a long string once. (Real friction, but a one-time event.)
+- Revocation is awkward. Because verification is offline, we can't "kill" a key once it's issued. The best we can do is set short expirations and force renewal, or maintain a revocation list the app fetches on launch (which then makes it not really offline).
+- We have to manage a private key safely. Lose it = anyone can forge keys. Leak it = same.
 
-This is the recommended pattern, and it's just A + B working together.
+**Good for.** Most customers, in most cases. This is the default we'll build first.
 
-The Worker runs first. It reads the host, looks up the config, and **injects the config into the HTML it sends back** as a small `<script>` tag. The React app boots, reads that `<script>` tag, and uses it.
+### Option D — Server-verified license key (online activation)
 
-```
-Browser → Worker (reads host → looks up config in KV → injects into HTML) → Pages serves the static React app → Browser parses HTML, reads injected config, boots React with it
-```
+**How it works.** Same UI as Option C — user pastes a license key on first launch. But instead of verifying the signature offline, the app sends the key to our small activation server. The server says "yes, that's Acme's key, valid until 2027" or "no, that key was revoked." The server returns a longer-lived auth token (often a JWT we sign on the fly) that the app uses for subsequent calls.
 
-This is what `vercel/platforms` does (the canonical multi-tenant Next.js template), what the [Cloudflare guide for multi-domain SaaS](https://medium.com/codex/how-i-use-cloudflare-to-build-multi-domain-saas-applications-with-react-single-page-applications-527e1a742401) does, and what [Cloudflare for Platforms](https://developers.cloudflare.com/cloudflare-for-platforms/) is built around.
+**Pros.**
+- Revocation is easy: we mark the key as revoked in our DB, and the next activation attempt fails.
+- We can update the tenant's config or gateway URL by re-issuing the response without changing the key the user has.
+- We can see who has activated (telemetry).
 
-We're going with Option C. The rest of this doc walks through it.
+**Cons.**
+- Requires us to run and maintain a server. Even a tiny one.
+- Requires the user to have internet on first launch. Annoying for offline-first shops.
+- One more thing to monitor and keep up. Outage = no new activations.
+
+**Good for.** Cases where you need real revocation, or where you anticipate frequent license issuance/changes.
+
+### Option E — Email/password account login
+
+**How it works.** Like signing into a normal SaaS app. The user types their email and password. The server says "your email belongs to Acme" and returns an auth token. The app stores the token and knows it's Acme.
+
+**Pros.**
+- Familiar pattern — every user understands "sign in with email and password."
+- Naturally per-user. You get individual user identities for free, which is useful for permissions and audit logs.
+- Password resets are a well-trodden problem with off-the-shelf solutions.
+
+**Cons.**
+- Requires us to run an auth server, manage password storage, handle resets, do all of the user-management drudgery.
+- Requires every employee to have an account before they can use the app. Onboarding 30 employees at a new fab shop means provisioning 30 accounts.
+- Annoying for offline-first shops (auth requires network).
+- For a dashboard that primarily *reads* live data from a local gateway, you're adding a whole user-account system just to learn the tenant slug. Heavy.
+
+**Good for.** Cases where per-user identity matters (e.g., approvals, comments, role-based access) — typically a later phase of the product, not Day 1.
+
+### Option F — MDM / Group Policy push
+
+**How it works.** The customer's IT department uses their device-management tool (Intune, JAMF, Workspace ONE, Group Policy, etc.) to push a registry key, plist entry, or config file containing the tenant slug to every employee's machine. The app reads from the OS-managed location on launch.
+
+**Pros.**
+- Truly zero-touch. Employees don't see an activation screen ever.
+- Centralized: IT can change the tenant assignment for a whole fleet at once.
+- IT departments already do this for other software, so it fits their workflow.
+
+**Cons.**
+- Only feasible for customers with managed devices and an IT team that does device management.
+- Different per OS — we have to support a Windows path, a macOS path, a Linux path. More code.
+- For Linux/personal Macs, may not apply.
+
+**Good for.** Large customers with proper IT (think 200+ employees with managed laptops). Not the default for a 100-employee fab shop, but nice to support eventually.
+
+### Comparison table
+
+| Option | One installer? | User friction | Server required? | Revocable? | Per-user identity? |
+|---|---|---|---|---|---|
+| A — Per-tenant installer | No | None | No | No (would need an updater) | No |
+| B — Drop-a-config-file | Yes | None for user; IT does setup | No | Weak (file can be replaced) | No |
+| **C — Offline license key** | **Yes** | **Paste a key once** | **No** | **Weak (expiry only)** | **No** |
+| D — Server-verified key | Yes | Paste a key once | Yes | Yes | No |
+| E — Email/password login | Yes | Sign in like SaaS | Yes | Yes | Yes |
+| F — MDM push | Yes | None | No | Via MDM | No |
 
 ---
 
-## 4. Picking the Worker framework: why Hono
+## 3. The recommendation: start with C, design so D and F can be added later
 
-You can write a Cloudflare Worker as a single function — the [Workers docs](https://developers.cloudflare.com/workers/) call this the "module syntax." Or you can use a tiny framework on top to handle routing, middleware, and TypeScript ergonomics.
+**For Day 1 of the new product, we'll do Option C — offline-signed license keys.** Reasons:
 
-For Workers, the framework most teams use is **[Hono](https://hono.dev/)**. It's:
-- Tiny (~12 KB)
-- Designed for edge runtimes
-- Has a very Express-like API
-- First-class TypeScript types
-- [Officially supported by Cloudflare](https://hono.dev/docs/getting-started/cloudflare-workers)
+- It's the only option that's both "one installer for everyone" AND "no server we have to run." Those two properties are huge early. We can ship updates and onboard new customers without standing up infrastructure.
+- It's tamper-proof. Users can't pretend to be someone else by editing files.
+- It's familiar from products like JetBrains IDEs and offline-licensed software — it's a model people have seen.
 
-If you've written any Express or Koa or Fastify, Hono will feel familiar. We'll use it because the alternative — raw `addEventListener('fetch', ...)` — gets ugly fast.
+**Design escape hatches now so we can evolve later:**
+
+- The license key payload contains a `gateway_url` (and other tenant-specific knobs). That means we can change a tenant's gateway URL by reissuing a key — no code change required.
+- The activation flow saves "tenant slug + tenant config" into a single local file. If we later want to switch to Option D (server-verified), we just change *how that file gets populated* — the rest of the app reads from the same place.
+- If a big customer asks for MDM (Option F) later, we add a "read from the OS-managed config location BEFORE showing the activation screen" check at the very top. Backward-compatible.
+
+We won't build E (full user accounts) yet, because the dashboard mostly just *displays* data — there's no obvious need for per-user identity in v1. We can add it later if the product grows toward features that need it (sign-offs, comments, etc.).
 
 ---
 
-## 5. The Worker code, line by line
+## 4. JWTs in plain English (because the rest of this doc uses them)
 
-Here's the full Worker. Every line explained immediately after.
+You don't have to understand the cryptography to read the rest of this doc, but you should know what a JWT is mechanically.
+
+A **JWT** is a string with three parts separated by dots:
+
+```
+HEADER.PAYLOAD.SIGNATURE
+```
+
+Each part is **base64url-encoded** — base64 is a way to write any data using only letters, digits, `-`, and `_`. So a JWT looks like a long jumble, but if you base64-decode each part:
+
+- **Header** decodes to JSON like `{"alg": "EdDSA", "typ": "JWT"}`. Says what algorithm signed it. `EdDSA` is a modern signature algorithm. Don't worry about the choice; we'll standardize on one.
+
+- **Payload** decodes to JSON like `{"tenant": "acme", "gateway_url": "http://10.0.5.20:8080", "exp": 1799999999}`. The actual claims. Tenant slug, expiry timestamp, gateway URL, anything else we want to ship in the key.
+
+- **Signature** is a cryptographic signature over the header + payload. It's computed using our **private key**. Anyone with our **public key** can verify it. Without the private key, you can't produce a valid signature for any change to the payload.
+
+That last property is the magic: **the payload is public (anyone can read it), but no one except us can modify it without breaking the signature.**
+
+To create a license key for Acme, we (on our laptop) do:
+
+```bash
+# Pseudo-code
+PAYLOAD='{"tenant":"acme","gateway_url":"http://10.0.5.20:8080","exp":1799999999}'
+SIGNATURE=ed25519_sign(PAYLOAD, OUR_PRIVATE_KEY)
+LICENSE=base64(HEADER) + "." + base64(PAYLOAD) + "." + base64(SIGNATURE)
+```
+
+We hand `LICENSE` to Acme. They paste it. The app:
+
+```rust
+// Pseudo-code, in the Rust side of Tauri
+let (header, payload, signature) = split_dots(license);
+if ed25519_verify(payload, signature, BAKED_IN_PUBLIC_KEY) {
+    let claims = parse_json(payload);
+    if claims.exp > now() {
+        save_to_local_config(claims);
+        return Ok(claims.tenant);
+    } else {
+        return Err("expired");
+    }
+} else {
+    return Err("invalid signature");
+}
+```
+
+That's the whole mechanism. No server, no database, no network — just math.
+
+### Key management (the boring but important part)
+
+The private key is the one secret we *cannot* lose. If it leaks, anyone can mint license keys for any tenant.
+
+Recommendations:
+
+- Generate the key pair once, store the private key in a password manager (or a hardware security module if you want to be fancy).
+- The signing tool (a small script we'll write — covered in doc 11) takes the private key path and the tenant slug, outputs a license key. Run on your laptop, manually, for each new customer.
+- The public key goes in source control, baked into the app. It's safe to publish.
+- Rotate the key pair every few years by signing license keys with the new pair AND keeping the old public key in the app for backward compatibility. (Edge case; cross that bridge later.)
+
+---
+
+## 5. The activation flow, step by step
+
+Now let's walk through what actually happens when a user runs the app for the first time. We'll cover:
+
+- What the screen looks like
+- What gets stored where
+- What happens on subsequent launches
+- All the failure modes
+
+### 5.1 First launch — the activation screen
+
+The user double-clicks the app icon. Tauri starts, the webview opens. The React app boots and immediately asks Rust: "Am I already activated?"
 
 ```ts
-// worker/index.ts
-import { Hono } from 'hono';
+// In src/App.tsx — pseudo-code
+import { invoke } from '@tauri-apps/api/core';
 
-type Env = {
-  TENANTS: KVNamespace;
-  ASSETS: Fetcher;
-};
+const tenant = await invoke<string | null>('get_activated_tenant');
+if (tenant === null) {
+  return <ActivationScreen />;
+} else {
+  return <Dashboard tenant={tenant} />;
+}
+```
 
-const app = new Hono<{ Bindings: Env }>();
+`get_activated_tenant` is a **Tauri command** (a Rust function exposed to the UI). It looks for a local file we created when activation succeeded, and returns the tenant slug if present.
 
-app.use('*', async (c, next) => {
-  const host = c.req.header('host') ?? '';
-  const slug = host.split('.')[0];
-  const config = await c.env.TENANTS.get(`tenants:${slug}`, 'json');
-  if (!config) return c.text('Unknown tenant', 404);
-  c.set('tenantConfig', config);
-  await next();
-});
+```rust
+// In src-tauri/src/commands.rs — pseudo-code
+#[tauri::command]
+fn get_activated_tenant(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = app.path().app_data_dir().unwrap().join("activation.json");
+    if !path.exists() { return Ok(None); }
 
-app.get('*', async (c) => {
-  const html = await (await c.env.ASSETS.fetch(c.req.raw)).text();
-  const injected = html.replace(
-    '<!--__TENANT__-->',
-    `<script id="__tenant__" type="application/json">${JSON.stringify(c.get('tenantConfig'))}</script>`,
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let activation: Activation = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+    // Still good?
+    if activation.exp < now() {
+        return Ok(None);  // expired; treat as not activated
+    }
+    Ok(Some(activation.tenant))
+}
+```
+
+The `app_data_dir` is a Tauri-provided path that resolves to the right OS-specific spot:
+
+- Windows: `C:\Users\<name>\AppData\Roaming\com.yourcompany.dashboard\`
+- macOS: `~/Library/Application Support/com.yourcompany.dashboard/`
+- Linux: `~/.local/share/com.yourcompany.dashboard/`
+
+If the file doesn't exist (first ever launch) or is expired, `get_activated_tenant` returns `None` and React renders the activation screen:
+
+```tsx
+// In src/ActivationScreen.tsx — pseudo-code
+function ActivationScreen() {
+  const [key, setKey] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    try {
+      const tenant = await invoke<string>('activate', { license: key.trim() });
+      // Activation saved a file. Reload the app.
+      window.location.reload();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  return (
+    <div>
+      <h1>Welcome — enter your license key</h1>
+      <p>Your IT person should have given you this. It looks like a long string of letters and numbers.</p>
+      <textarea value={key} onChange={e => setKey(e.target.value)} rows={4} />
+      <button onClick={submit} disabled={!key}>Activate</button>
+      {error && <p style={{color: 'red'}}>{error}</p>}
+    </div>
   );
-  return c.html(injected);
-});
-
-export default app;
+}
 ```
 
-That's the whole Worker. ~20 lines. Now let's walk through it.
+### 5.2 The `activate` command
 
-### 5.1 The imports and types
+When the user clicks "Activate," React calls the Rust `activate` command:
 
-```ts
-import { Hono } from 'hono';
-```
+```rust
+// In src-tauri/src/commands.rs — pseudo-code
+use ed25519_dalek::{Verifier, VerifyingKey, Signature};
 
-Imports the Hono framework.
+// The public key — baked in at compile time. Generated once, never changes.
+const PUBLIC_KEY_BYTES: &[u8] = include_bytes!("../keys/public.bin");
 
-```ts
-type Env = {
-  TENANTS: KVNamespace;
-  ASSETS: Fetcher;
-};
-```
-
-This declares the **bindings** the Worker uses. A "binding" in Cloudflare-speak is something the Worker can access at runtime — a KV namespace, an R2 bucket, a D1 database, or a connection to your Pages assets. Bindings are configured in `wrangler.toml` (Cloudflare's deployment config file). At runtime they appear on `c.env`.
-
-- `TENANTS: KVNamespace` — this is a KV namespace called `TENANTS`. We'll use it to store per-tenant configs under keys like `tenants:acme`, `tenants:bobs-beams`, etc.
-- `ASSETS: Fetcher` — this is the binding to Cloudflare Pages, where our React app's static files live. Calling `ASSETS.fetch(request)` says "ask Pages to serve this request as if the Worker weren't here." That's how we hand off to the static React app while still being able to modify the response.
-
-### 5.2 Creating the app
-
-```ts
-const app = new Hono<{ Bindings: Env }>();
-```
-
-Creates a Hono app, telling TypeScript "the bindings will match the `Env` type I just defined." This is what makes `c.env.TENANTS` properly typed later.
-
-### 5.3 The middleware that does tenant resolution
-
-```ts
-app.use('*', async (c, next) => {
-  ...
-});
-```
-
-`app.use('*', ...)` registers **middleware** — a function that runs on EVERY request (`*` = all paths). Middleware can do work, then call `next()` to pass the request along to the actual handler.
-
-The first argument to the middleware function is `c`, Hono's "context" object. It has helpers for reading the request, setting response headers, accessing bindings, etc.
-
-```ts
-  const host = c.req.header('host') ?? '';
-```
-
-Reads the `Host` header from the request. If for some weird reason it's missing, fall back to empty string. (`??` is JavaScript's "nullish coalescing operator" — it means "use the right side if the left side is null or undefined.")
-
-```ts
-  const slug = host.split('.')[0];
-```
-
-Splits the host on `.` and takes the first piece. So `acme.app.example.com` → `['acme', 'app', 'example', 'com']` → `'acme'`.
-
-```ts
-  const config = await c.env.TENANTS.get(`tenants:${slug}`, 'json');
-```
-
-Looks up the tenant config in KV.
-- `c.env.TENANTS` is the KV namespace binding (from §5.1).
-- `.get(key, 'json')` reads the value at that key and parses it as JSON.
-- The key is `tenants:acme` (or whatever the slug is). Using a prefix like `tenants:` is good practice — KV is shared across uses, and a prefix prevents collisions if you later store other things in the same namespace.
-
-If the key doesn't exist, `.get` returns `null`.
-
-```ts
-  if (!config) return c.text('Unknown tenant', 404);
-```
-
-If we didn't find a config for this slug, return 404. This is the gate that protects against `hacker.app.example.com`. The user gets a clean error and zero app code is shipped.
-
-```ts
-  c.set('tenantConfig', config);
-  await next();
-});
-```
-
-`c.set` stores something in the request-scoped context — like attaching it to the request as it flows through. Later handlers can call `c.get('tenantConfig')` to retrieve it.
-
-`await next()` hands the request off to the next handler in the chain (which will be the GET handler below). After that handler runs, we'd come back here if there were code after `next()`, but there isn't — the middleware is done.
-
-### 5.4 The GET handler that serves the modified HTML
-
-```ts
-app.get('*', async (c) => {
-  ...
-});
-```
-
-Registers a handler for GET requests on all paths. Hono runs this AFTER the middleware (because the middleware called `next()`).
-
-```ts
-  const html = await (await c.env.ASSETS.fetch(c.req.raw)).text();
-```
-
-This is the dense line. Read it inside-out:
-
-1. `c.req.raw` is the raw `Request` object (the standard Web API one).
-2. `c.env.ASSETS.fetch(c.req.raw)` says "send this request to Pages and let it serve the static asset." For a request to `/`, Pages returns `index.html`. For `/assets/main-abc123.js`, it returns that JS file.
-3. `await ...` — `fetch` returns a Promise that resolves to a `Response`.
-4. `.text()` reads the response body as text. Returns another Promise.
-5. `await ...` — wait for that.
-6. `const html = ...` — now we have the HTML as a string.
-
-So this line says: "fetch what Pages would normally serve, get its body as text, save into `html`." For a request to `/`, that's `index.html`.
-
-```ts
-  const injected = html.replace(
-    '<!--__TENANT__-->',
-    `<script id="__tenant__" type="application/json">${JSON.stringify(c.get('tenantConfig'))}</script>`,
-  );
-```
-
-Find the placeholder `<!--__TENANT__-->` in the HTML and replace it with a `<script>` tag containing the tenant's config as JSON.
-
-The placeholder needs to be in our `index.html` template. Open `app/index.html` and add it where you want the config injected — usually right before the closing `</head>`:
-
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    ...
-    <!--__TENANT__-->
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-```
-
-When the Worker runs, it replaces that comment with:
-
-```html
-<script id="__tenant__" type="application/json">
-  {"tenantId":"tnt_01H...","slug":"acme","enabledModules":[...]}
-</script>
-```
-
-Two important details:
-
-1. **`type="application/json"`** — this is critical. By default, the browser would try to *execute* a `<script>` tag as JavaScript. Setting `type="application/json"` makes it inert — the browser just stores the contents as text, and we'll parse it ourselves in React.
-
-2. **`JSON.stringify(...)`** — escapes any characters that would otherwise break out of the string. Important if config strings contain quotes or `<` characters. (For really paranoid escaping you'd want to additionally replace `</script>` to prevent the script tag from closing early, but `JSON.stringify` handles the common cases.)
-
-```ts
-  return c.html(injected);
-});
-```
-
-Return the modified HTML to the browser. `c.html` sets the `Content-Type` to `text/html` automatically.
-
-```ts
-export default app;
-```
-
-Cloudflare Workers expect a default export of the app. Hono's `app` is the right shape — Cloudflare calls its `fetch` method on every incoming request.
-
----
-
-## 6. The React side, line by line
-
-The React app boots normally. Just before any rendering, we read the injected config.
-
-```ts
-// src/tenant.ts
-import type { TenantConfig } from './types/tenantConfig';
-
-const raw = document.getElementById('__tenant__')?.textContent;
-
-export const tenantConfig: TenantConfig = raw
-  ? JSON.parse(raw)
-  : (import.meta.env.DEV ? import.meta.env.VITE_DEV_TENANT : null);
-
-if (!tenantConfig) throw new Error('No tenant config available');
-```
-
-Walking through:
-
-```ts
-const raw = document.getElementById('__tenant__')?.textContent;
-```
-
-Find the `<script id="__tenant__">` we injected. The `?.` is "optional chaining" — if `getElementById` returns null (no such element), the whole expression is `undefined` instead of crashing.
-
-`.textContent` is the text inside the tag — our JSON string.
-
-```ts
-export const tenantConfig: TenantConfig = raw
-  ? JSON.parse(raw)
-  : (import.meta.env.DEV ? import.meta.env.VITE_DEV_TENANT : null);
-```
-
-If we got the JSON, parse it. If we didn't (because `<script id="__tenant__">` wasn't there), check if we're in dev mode (`import.meta.env.DEV` is Vite's flag for "we're running `vite dev`"). In dev, fall back to a config from an environment variable.
-
-```ts
-if (!tenantConfig) throw new Error('No tenant config available');
-```
-
-If neither worked, crash loud and clear. Better than silently rendering a half-broken UI.
-
-Then anywhere else in the app that needs the config, you import it:
-
-```ts
-import { tenantConfig } from './tenant';
-console.log(tenantConfig.enabledModules);
-```
-
-That's it. The React side is genuinely tiny. All the magic is in the Worker injecting the config and the `<script>` tag pattern.
-
----
-
-## 7. Local dev — the localhost problem
-
-There's one annoying problem. When you run `vite dev` locally, your app is at `http://localhost:5173`. There's no subdomain. The Worker isn't running. So:
-
-```ts
-const slug = window.location.hostname.split('.')[0];
-// 'localhost' — uh oh
-```
-
-Three ways to fix this, in increasing order of effort:
-
-### 7.1 Option 1 — Env var fallback (do this on day one)
-
-In your `.env.development`:
-
-```
-VITE_DEV_TENANT_SLUG=acme
-```
-
-In `vite.config.ts`, expose it (Vite's `import.meta.env.VITE_*` is automatic — anything starting with `VITE_` is available in the app at build time).
-
-In `tenant.ts`, fall back to reading the env var and loading from a local file:
-
-```ts
-const raw = document.getElementById('__tenant__')?.textContent;
-
-let tenantConfig: TenantConfig | null = null;
-
-if (raw) {
-  tenantConfig = JSON.parse(raw);
-} else if (import.meta.env.DEV) {
-  const slug = import.meta.env.VITE_DEV_TENANT_SLUG;
-  // Vite's import.meta.glob loads JSON files at build time
-  const tenantConfigs = import.meta.glob('../tenants/*.json', { eager: true });
-  tenantConfig = tenantConfigs[`../tenants/${slug}.json`]?.default ?? null;
+#[derive(serde::Deserialize)]
+struct Claims {
+    tenant: String,
+    gateway_url: String,
+    exp: u64,
 }
 
-if (!tenantConfig) throw new Error('No tenant config available');
-export { tenantConfig };
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Activation {
+    tenant: String,
+    gateway_url: String,
+    exp: u64,
+    activated_at: u64,
+}
+
+#[tauri::command]
+fn activate(app: tauri::AppHandle, license: String) -> Result<String, String> {
+    // 1. Split "header.payload.signature"
+    let parts: Vec<&str> = license.split('.').collect();
+    if parts.len() != 3 { return Err("Not a license key.".into()); }
+
+    let header_b64 = parts[0];
+    let payload_b64 = parts[1];
+    let signature_b64 = parts[2];
+
+    // 2. Decode the signature.
+    let signature_bytes = base64_url_decode(signature_b64)?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|e| e.to_string())?;
+
+    // 3. Verify the signature against (header + "." + payload).
+    let pubkey = VerifyingKey::from_bytes(PUBLIC_KEY_BYTES.try_into().unwrap())
+        .map_err(|e| e.to_string())?;
+    let signed_message = format!("{}.{}", header_b64, payload_b64);
+    pubkey.verify(signed_message.as_bytes(), &signature)
+        .map_err(|_| "License key signature is not valid. Did you copy the whole thing?")?;
+
+    // 4. Decode and parse the payload.
+    let payload_json = base64_url_decode(payload_b64)?;
+    let claims: Claims = serde_json::from_slice(&payload_json)
+        .map_err(|_| "License key payload is malformed.")?;
+
+    // 5. Check expiry.
+    if claims.exp < now_seconds() {
+        return Err("This license key has expired. Contact support.".into());
+    }
+
+    // 6. Save activation.json.
+    let activation = Activation {
+        tenant: claims.tenant.clone(),
+        gateway_url: claims.gateway_url,
+        exp: claims.exp,
+        activated_at: now_seconds(),
+    };
+    let path = app.path().app_data_dir().unwrap().join("activation.json");
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&path, serde_json::to_string_pretty(&activation).unwrap())
+        .map_err(|e| e.to_string())?;
+
+    // 7. Return the tenant slug so the UI can immediately continue.
+    Ok(claims.tenant)
+}
 ```
 
-In `app/tenants/acme.json` you put Acme's config. When you run `vite dev`, you're dev-ing as Acme. Change the env var to dev as a different tenant.
+That's a chunk of code, so let me explain each step in beginner terms.
 
-Easy, fast, no setup beyond an env var. **Use this.**
+- **Step 1.** A JWT is "three things joined by dots." We split it and check we got three pieces. If not, the user pasted half a key or some random text.
+- **Step 2.** The signature part is base64-encoded; we decode it into raw bytes. The `Signature::from_slice` call wraps those bytes in a type the crypto library understands.
+- **Step 3.** We construct a `VerifyingKey` from the public key bytes (which were embedded at compile time via `include_bytes!`). Then we ask: "does this signature match `header.payload`, using this public key?" If yes, the key was signed by whoever holds our private key — which is only us. If no, someone tampered with the token, or the user pasted garbage.
+- **Step 4.** We decode the payload (which is base64) and parse the JSON inside. `serde_json` is Rust's JSON parser. The `Claims` struct says "the JSON has these fields."
+- **Step 5.** We check the expiry. The `exp` field is a Unix timestamp — seconds since 1970-01-01. If it's in the past, the key is expired.
+- **Step 6.** We save everything we need from the key (plus when we activated, for logging) into `activation.json` under the OS-specific app-data directory. Next launch we just read this file.
+- **Step 7.** Return the tenant slug. The UI was awaiting this; now it can reload and show the dashboard.
 
-### 7.2 Option 2 — `*.localhost` subdomains
+### 5.3 Subsequent launches
 
-macOS, Linux, and modern Windows browsers natively resolve any `*.localhost` name to `127.0.0.1`. So `http://acme.localhost:5173` actually works in a browser, no `/etc/hosts` editing needed.
+Now the app already has `activation.json`. On every subsequent launch, `get_activated_tenant` reads that file, optionally re-checks expiry, and returns the tenant slug immediately. No prompt, no key entry. The user just sees the dashboard.
 
-You point Vite at the same port, then in your code, the same `host.split('.')[0]` logic gives you `'acme'` from `acme.localhost`.
+If the activation has expired, we drop back to the activation screen and tell them to get a fresh key.
 
-Useful when you have designers or PMs poking at the dev server and want a more realistic URL.
+### 5.4 Failure modes and what to show
 
-### 7.3 Option 3 — Run the actual Worker locally
+A short table because the user-facing messages matter:
 
-`wrangler pages dev` runs your Pages site AND your Worker in front of it, locally. You get the full production-shaped flow. But it's slower than `vite dev` and you have to deal with KV emulation. Use this only when the Worker logic itself gets complicated enough that you need to debug it locally.
+| Failure | What to show |
+|---|---|
+| Garbage in the textbox (no dots) | "That doesn't look like a license key. It should be a long string starting with a few letters and containing dots." |
+| Right shape but signature bad | "License key is invalid. Make sure you copied the whole thing, including the dots." |
+| Right shape, signature good, expired | "Your license key expired on <date>. Contact your IT person or our support to get a new one." |
+| Right shape, signature good, missing fields | "License key is malformed. (This shouldn't happen — please contact support.)" |
+| `activation.json` exists but is corrupted | Delete the file, drop to activation screen. |
+| `activation.json` exists but expired | Same as 'expired' above — drop to activation screen with the expired message. |
 
-**Recommendation:** ship with Option 1 from day one. Add Option 2 if you want nicer URLs for non-developers. Only do Option 3 when the Worker logic grows beyond the ~20 lines we have now.
+Plain, friendly error messages. Most of the failure modes here are "user mispasted the key." Make it easy to fix.
 
 ---
 
-## 8. What the Worker file structure looks like
+## 6. Local development — how do you test without real keys?
 
-Concretely, your repo will grow a `worker/` folder alongside `app/`:
+In dev mode, asking yourself to issue a real license key every time you `npm run tauri dev` is annoying. Two patterns help:
 
-```
-powerfab-dashboard/
-├── app/                    ← React/Vite app (existing)
-│   ├── src/
-│   ├── index.html          ← Add <!--__TENANT__--> here
-│   └── ...
-├── worker/                 ← NEW: the Worker
-│   ├── index.ts            ← The code from §5
-│   ├── package.json
-│   └── tsconfig.json
-├── tenants/                ← NEW: per-tenant config JSON files
-│   ├── acme.json
-│   ├── bobs-beams.json
-│   └── ...
-├── wrangler.toml           ← NEW: Cloudflare deployment config
-└── ...
-```
+### 6.1 Dev license keys
 
-`wrangler.toml` is where you wire up bindings. Roughly:
+We generate a separate dev key pair (different from production). The dev public key is baked into debug builds; the dev private key sits in your repo (gitignored or stored locally). You write a small script — `tools/sign-license.ts` — that signs a key with the dev private key for any tenant you want:
 
-```toml
-name = "powerfab-dashboard"
-main = "worker/index.ts"
-compatibility_date = "2026-05-01"
-
-[assets]
-directory = "app/dist"
-binding = "ASSETS"
-
-[[kv_namespaces]]
-binding = "TENANTS"
-id = "<your-kv-namespace-id-from-cloudflare>"
+```bash
+$ npx tsx tools/sign-license.ts --tenant acme --days 30
+eyJhbGciOiJFZERTQSJ9.eyJ0ZW5h...
 ```
 
-The exact wrangler.toml setup is in the Cloudflare docs ([Workers + Pages Assets](https://developers.cloudflare.com/workers/static-assets/), [KV bindings](https://developers.cloudflare.com/kv/api/workers-api-bindings/)). We'll wire it up for real when we actually deploy.
+Paste the output into your running dev app and you're activated as Acme.
+
+### 6.2 `DEV_TENANT` environment variable
+
+For "I want to start as Acme without going through the activation screen," support an env var:
+
+```bash
+$ DEV_TENANT=acme npm run tauri dev
+```
+
+In Rust, on startup, if `cfg!(debug_assertions)` (i.e., debug build) and `DEV_TENANT` is set, write a fake `activation.json` with that tenant and a far-future expiry. Skip the activation screen entirely. Only works in debug builds — release builds ignore this.
+
+This is the equivalent of "load a fake config in local dev because localhost has no subdomain" from the old web plan.
 
 ---
 
-## 9. What about new tenant onboarding?
+## 7. Issuing license keys (the operations side)
 
-Now you can answer "what does it take to onboard Acme?" — concretely:
+For each new customer:
 
-1. **DNS:** none — wildcard subdomain handles it.
-2. **Config:** create `tenants/acme.json` (in MVP) or write `tenants:acme` to KV (later).
-3. **Data:** kick off the nightly pipeline for Acme so their JSON snapshots land in R2 (covered in `03-customer-data-ingest.md`, the data ingest doc).
-4. **Auth:** create their first user account (covered in a future doc).
+1. Pick a tenant slug. `acme`, `bigshop`, `briansbeams`. Lowercase, no spaces, stable. Once chosen, don't change it. It'll appear in filenames and logs forever.
 
-That's it. No code change. No deploy. New tenant goes live the moment their config and data are present.
+2. Pick a gateway URL. This is the address where the customer's data gateway lives inside their network. Could be `http://10.0.5.20:8080` (LAN IP) or `http://gateway.acme.local:8080` (local DNS). We get this from the customer during onboarding.
 
-This is the payoff of the architecture. It's what makes 200 tenants feasible.
+3. Pick an expiry. We recommend 12-month expiries for paying customers. (Renewal is just "issue a new key.")
 
----
+4. Run the signing tool:
 
-## 10. What if a tenant wants their own custom domain?
+   ```bash
+   $ npx tsx tools/sign-license.ts \
+       --tenant acme \
+       --gateway-url http://10.0.5.20:8080 \
+       --days 365
+   eyJhbGciOiJFZERTQSJ9.eyJ0ZW5h...
+   ```
 
-Some bigger customers will say "we don't want our dashboard at `acme.app.example.com` — we want it at `dashboard.acme.com`." You can do that with [Cloudflare for SaaS](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/) (formerly "Custom Hostnames"). They add a CNAME, you add their hostname to your account, Cloudflare handles SSL automatically.
+5. Email/Slack/whatever the key to the customer's IT person.
 
-In the Worker, you'd map `dashboard.acme.com` → `acme` slug via a lookup table in KV (`hostnames:dashboard.acme.com` → `acme`). Same flow otherwise.
-
-This is a Phase 2 thing. Skip for now.
-
----
-
-## 11. By the end of this doc you should know
-
-- What a `Host` header is and why it's how the browser tells the server which subdomain.
-- What a **wildcard DNS record** is and why we want one.
-- The three places to extract the subdomain (browser / Worker / both) and why we picked the third.
-- What every line of the Worker does — host extraction, KV lookup, 404 on unknown, HTML rewrite to inject config.
-- What the React side does to read the injected config.
-- How to dev locally without a real subdomain.
-- What it takes to onboard a new tenant once this is set up.
-
-If `c.env.TENANTS.get(...)` or `c.req.header(...)` still feels mysterious, the [Hono docs](https://hono.dev/docs/api/context) have a great reference. The key intuition: Hono's `c` is just a request-scoped object that bundles the request, response helpers, and Cloudflare bindings. That's all.
+The full tenant-onboarding process is covered in doc 11. This is just the "issue a key" piece.
 
 ---
 
-**Next:** `02-config.md` — what's actually in a tenant config, what Zod is, and where the configs live (KV vs JSON-in-repo vs D1, plain English).
+## 8. Why this is better than the old subdomain approach
 
-> If you got this far and the level felt right, tell me and I'll write 02 / 03 / 04 next. If anything was confusing or moved too fast, tell me which section — I'll rewrite it before writing the rest.
+The original plan used `acme.app.example.com` to identify the tenant. That worked because the browser puts the host in every HTTP request — the server can read it and know who's asking. We've replaced that with a license key. A few notes on why this is actually nicer for our use case:
+
+- **Subdomains require DNS, certificates, and a wildcard hosting setup.** Tedious. License keys require none of that — just a key pair we manage once.
+
+- **Subdomains require the user to type the right URL.** A fab shop employee has to know "go to `acme.app.example.com`, not `acme.com`." With a desktop app, they just open the icon on their desktop.
+
+- **License keys carry per-tenant config.** The gateway URL travels with the key, so we don't need a central directory mapping `acme` → "your gateway is at 10.0.5.20." It's all in the token.
+
+- **Offline.** Subdomain-based identification needs DNS to resolve and HTTPS to terminate. License-key activation works on a laptop with no internet.
+
+The tradeoff: subdomains support unauthenticated users showing up out of the blue and being correctly routed. License keys require the customer to have a key before they can use the app at all. For our case — a paid product with a known customer list — that's fine. We *want* "no key, no entry."
+
+---
+
+## 9. By the end of this doc you should know
+
+- What tenant resolution means and why the desktop version is different from the web version.
+- The six broad approaches to tenant identity on the desktop (A through F) and their tradeoffs.
+- Why we're starting with Option C: offline-signed license keys.
+- What a JWT is, mechanically: header + payload + signature.
+- The role of the private and public keys (sign vs. verify).
+- The first-launch activation flow end-to-end: activation screen → `activate` command → write `activation.json` → reload to dashboard.
+- How subsequent launches skip the activation screen by reading the cached file.
+- How to test in local dev without juggling real license keys.
+- How we'll issue keys to a new customer in practice.
+
+If any of that is fuzzy, the JWT section (§4) is the single most important piece — re-read it until "sign on our side, verify on theirs" feels obvious.
+
+---
+
+**Next:** [`02-config.md`](./02-config.md) — once we know we're Acme, what does Acme's config look like, and where does it live?

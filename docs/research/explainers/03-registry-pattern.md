@@ -1,10 +1,10 @@
 # 03 — The Registry Pattern: How Config Decides What to Render
 
-> **Pre-reqs:** Read `00-start-here.md`, `01-tenant-resolution.md`, `02-config.md` in order.
+> **Prerequisites:** read [`00-start-here.md`](./00-start-here.md), [`01-tenant-resolution.md`](./01-tenant-resolution.md), [`02-config.md`](./02-config.md) in order.
 >
-> **What you'll know by the end:** What a "registry" actually IS in code. How a JSON config picks which React components render. Every TypeScript trick (`as const`, `satisfies`, `keyof typeof`, derived unions) explained from scratch with examples. What lazy loading and Suspense are and how they keep the bundle small. The full type-safety chain — registry → types → schema → CI — that catches a renamed metric in three places.
+> **By the end of this doc you will know:** what a "registry" actually IS in code. How a JSON config picks which React components render. Every TypeScript trick (`as const`, `satisfies`, `keyof typeof`, derived unions) explained from scratch with examples. What lazy loading and Suspense are and how they keep the bundle small. The full type-safety chain — registry → types → schema → CI — that catches a renamed metric in three places.
 
-This is the most important doc in the series. Take your time.
+This is the most important doc in the series. Take your time. **Almost nothing here changes between the old web plan and the new Tauri plan** — the registry pattern is pure React/TypeScript and works the same inside Tauri's webview as it would on Cloudflare Pages.
 
 ---
 
@@ -422,17 +422,17 @@ If you wanted to handle disabled modules differently (show a "not available" til
 
 Up to now we've been importing all 80 metric components at the top of the registry file. That works, but it means the user's browser downloads code for all 80 metrics on first page load — even if they're only seeing 12. Wasteful.
 
-**Lazy loading** = only download the code for a component when it's actually about to render.
+**Lazy loading** = only load the code for a component when it's actually about to render.
 
 ### 7.1 What's a "bundle"?
 
-When you build your Vite app (`pnpm build`), Vite runs through your imports and produces a few output files:
+When you build your Vite app (`npm run build`), Vite runs through your imports and produces a few output files:
 
 - `index-abc123.html`
 - `assets/main-def456.js` — your app's code
 - `assets/main-def456.css` — your styles
 
-The browser downloads `main-def456.js` on first page load. If you imported every metric component at the top, ALL their code is in there. Hundreds of KB of "you might need this" before the user sees anything.
+Inside the Tauri installer, those files are embedded — the webview loads them from disk at startup. If you imported every metric component at the top of one file, ALL their code is in `main-def456.js`. Hundreds of KB the webview has to parse on first paint before the user sees anything. Lazy loading lets us parse and execute only what's needed *now*.
 
 ### 7.2 Code splitting — the fix
 
@@ -446,7 +446,7 @@ import WinRate from '../panels/estimating/WinRate';
 () => import('../panels/estimating/WinRate')
 ```
 
-The dynamic version doesn't run at build time. It runs at runtime, when JavaScript executes the function. At that moment, the browser fetches `WinRate-xyz789.js` from the server.
+The dynamic version doesn't run at build time. It runs at runtime, when JavaScript executes the function. At that moment, the webview loads `WinRate-xyz789.js` from disk (the chunk is embedded inside the installer like all other assets — there's no network round trip).
 
 The build creates a separate JS file per chunk:
 
@@ -546,8 +546,10 @@ Walking through:
 
 For our app specifically: 80 metrics, each ~5–20 KB after gzip = ~1 MB if everything were in one bundle. But:
 
-- Splitting per-metric = 80 chunks = 80 round trips on first dashboard view = slower.
-- Splitting per-module = 7 chunks = 7 round trips = faster, and you don't fetch the Time chunk until the user opens Time.
+- Splitting per-metric = 80 chunks = 80 small parse/eval steps on first dashboard view = slower.
+- Splitting per-module = 7 chunks = 7 parse/eval steps = faster, and the Time chunk isn't loaded until the user opens Time.
+
+(In a web app these would be 80 vs. 7 *network* round trips. In our Tauri build the chunks live on disk so the cost is parsing/evaluating, not downloading — but the same logic for picking the granularity applies.)
 
 If your dashboard renders all 7 modules on one screen (like we do), per-module is the right granularity. If your app had a side nav and only loaded one module at a time, per-module would still be right.
 
@@ -615,8 +617,8 @@ What happens when you rename `time.weekly-hours` to `time.weekly-payroll-hours`?
 
 1. **Link 1 fires:** the registry now has `time.weekly-payroll-hours` instead. `MetricId` no longer includes `time.weekly-hours`.
 2. **Link 2 fires:** every TS file that referenced `time.weekly-hours` (e.g. in `MODULE_DEFAULTS`) becomes a compile error. Build fails.
-3. **Link 3 fires:** if you somehow ship anyway, the Zod parse on each tenant config that still mentions `time.weekly-hours` fails at Worker load time. The Worker returns a clean error.
-4. **Link 4 fires:** the rename PR's CI catches every JSON config that still mentions the old ID. Build fails BEFORE deploy.
+3. **Link 3 fires:** if you somehow ship anyway, the Zod parse on the tenant config fails at app startup with a clean error message. The dashboard refuses to render rather than silently breaking.
+4. **Link 4 fires:** the rename PR's CI catches every JSON config that still mentions the old ID. Build fails BEFORE the installer is ever produced.
 
 Three independent gates. The redundancy is the point. Configurability is cheap when the type system enforces it; catastrophic when it doesn't.
 
