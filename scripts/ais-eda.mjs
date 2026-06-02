@@ -20,6 +20,7 @@ import { fetchDmaAis } from "../src/ais/fetchDmaAis.mjs";
 import { computeEda, formatEdaReport } from "../src/ais/eda.mjs";
 import { auditQuality, formatQualityReport } from "../src/ais/quality.mjs";
 import { histogramSvg, trackMapSvg, barChartSvg } from "../src/ais/charts.mjs";
+import { analyzeFocus, formatFocusReport } from "../src/ais/deepDive.mjs";
 
 const args = process.argv.slice(2);
 const getFlag = (name) => {
@@ -37,6 +38,8 @@ const boundingBox = bboxArg
 const outPath = getFlag("--out");
 const date = getFlag("--date");
 const chartsDir = getFlag("--charts");
+const flagCode = getFlag("--flag"); // e.g. RU  (focus a deep dive on one flag)
+const militaryOnly = args.includes("--military");
 
 const loadRecords = async () => {
   if (date) {
@@ -62,6 +65,15 @@ const loadRecords = async () => {
 const records = await loadRecords();
 const eda = computeEda(records);
 let report = `${formatEdaReport(eda)}\n\n${formatQualityReport(auditQuality(records))}\n`;
+
+// Optional focused deep dive (e.g. --flag RU --military).
+if (flagCode || militaryOnly) {
+  const focus = analyzeFocus(records, {
+    flagCode: flagCode ?? null,
+    militaryOnly,
+  });
+  report += `\n${formatFocusReport(focus)}\n`;
+}
 
 if (chartsDir) {
   mkdirSync(chartsDir, { recursive: true });

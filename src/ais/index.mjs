@@ -36,6 +36,9 @@ export {
 } from "./eda.mjs";
 export { isValidMmsi, auditQuality, formatQualityReport } from "./quality.mjs";
 export { histogram, histogramSvg, barChartSvg, trackMapSvg } from "./charts.mjs";
+export { MID_TO_FLAG, getMid, getFlagInfo, isFlag, isRussianFlag } from "./flags.mjs";
+export { classifyVessel, isMilitary, isLawEnforcement } from "./classify.mjs";
+export { CAVEATS, analyzeFocus, formatFocusReport } from "./deepDive.mjs";
 export {
   resolveApiKey,
   buildSubscription,

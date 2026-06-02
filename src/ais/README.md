@@ -99,6 +99,40 @@ console.log(formatEdaReport(computeEda(records)));
 console.log(formatQualityReport(auditQuality(records)));
 ```
 
+## Focused deep dive (flag + military)
+
+Built for monitoring Russian military/naval transits through the Danish Straits,
+but parameterised by flag and military filter.
+
+```bash
+# Russian-flagged, military-classified, on a local file:
+node scripts/ais-eda.mjs aisdk-2023-01-01.zip --flag RU --military \
+  --bbox 54,58,9,14 --out report.md
+```
+
+Identification (all from self-declared AIS — see caveats):
+- **Flag** = MMSI MID prefix (`getFlagInfo`); **Russia = MID 273**.
+- **Military** = AIS ship-type `35` / DMA "Military" text; **law enforcement** = `55`.
+  Optional `watchlist` of known MMSIs / name fragments via the API.
+- **"Going dark"** = reporting gaps ≥ threshold, flagged per vessel.
+
+```js
+import { analyzeFocus, formatFocusReport } from "./src/ais/deepDive.mjs";
+const focus = analyzeFocus(records, {
+  flagCode: "RU",
+  militaryOnly: true,
+  gapMinutes: 30,
+  watchlist: { mmsi: ["273XXXXXX"], names: ["Admiral", "RFS"] },
+});
+console.log(formatFocusReport(focus));
+```
+
+> ⚠️ **Hard limits.** AIS is self-reported: warships routinely switch it off or
+> spoof MMSI/name/type, and DMA only covers Danish/Baltic/North Sea approaches.
+> Results are a **floor, not an order of battle** — useful for transit-spotting
+> and pattern-of-life on auxiliaries/support ships, not comprehensive coverage.
+> Every focus report prints these caveats inline.
+
 ## Tests
 
 No dependencies — uses Node's built-in test runner (Node 22+):
