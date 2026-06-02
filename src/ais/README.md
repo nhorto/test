@@ -67,20 +67,36 @@ const handle = collectAisStream({
 ## Exploratory data analysis
 
 ```bash
-# Local CSV or zip (offline):
-node scripts/ais-eda.mjs path/to/aisdk-2023-01-01.zip --bbox 55,56.2,12,13
+# Local CSV or zip (offline), with charts:
+node scripts/ais-eda.mjs path/to/aisdk-2023-01-01.zip --bbox 55,56.2,12,13 \
+  --charts charts/ --out report.md
 
 # Or fetch + analyze in one go (needs network):
 node scripts/ais-eda.mjs --date 2023-01-01 --bbox 55,56.2,12,13 --out report.md
 ```
 
-Produces an overview (record/vessel counts, time range, bounding box), speed
-distribution, per-vessel activity and distances, ship-type / status / mobile-type
-breakdowns, field completeness, and an hourly histogram. Programmatic use:
+The report has three parts:
+
+1. **Summary** — record/vessel counts, time range, bounding box, speed (SOG)
+   distribution, per-vessel activity and distances, ship-type / status /
+   mobile-type breakdowns, field completeness, hourly histogram.
+2. **Data-quality audit** — invalid MMSIs, "speed not available" sentinels,
+   implausible speeds, position jumps (teleporting fixes), duplicate reports,
+   and reporting-gap statistics.
+3. **Charts** (with `--charts <dir>`) — standalone **SVG** files: speed
+   histogram, records-per-hour bar chart, and a vessel-position map. SVG renders
+   in any browser; PNG conversion needs an external tool (rsvg-convert /
+   ImageMagick), which isn't bundled.
+
+Programmatic use:
 
 ```js
 import { computeEda, formatEdaReport } from "./src/ais/eda.mjs";
+import { auditQuality, formatQualityReport } from "./src/ais/quality.mjs";
+import { histogramSvg, trackMapSvg } from "./src/ais/charts.mjs";
+
 console.log(formatEdaReport(computeEda(records)));
+console.log(formatQualityReport(auditQuality(records)));
 ```
 
 ## Tests

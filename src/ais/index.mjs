@@ -27,6 +27,16 @@ export {
 } from "./tracks.mjs";
 export { downloadDmaCsv, fetchDmaAis } from "./fetchDmaAis.mjs";
 export {
+  quantile,
+  summarize,
+  valueCounts,
+  haversineNm,
+  computeEda,
+  formatEdaReport,
+} from "./eda.mjs";
+export { isValidMmsi, auditQuality, formatQualityReport } from "./quality.mjs";
+export { histogram, histogramSvg, barChartSvg, trackMapSvg } from "./charts.mjs";
+export {
   resolveApiKey,
   buildSubscription,
   normalizeAisStreamMessage,

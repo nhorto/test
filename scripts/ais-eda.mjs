@@ -10,13 +10,16 @@
 // Works fully offline against a local CSV or zip; the --date mode requires
 // outbound access to web.ais.dk.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { extractFirstCsv } from "../src/ais/unzip.mjs";
 import { parseDmaCsv } from "../src/ais/parseDmaAis.mjs";
 import { filterByBoundingBox } from "../src/ais/tracks.mjs";
 import { fetchDmaAis } from "../src/ais/fetchDmaAis.mjs";
 import { computeEda, formatEdaReport } from "../src/ais/eda.mjs";
+import { auditQuality, formatQualityReport } from "../src/ais/quality.mjs";
+import { histogramSvg, trackMapSvg, barChartSvg } from "../src/ais/charts.mjs";
 
 const args = process.argv.slice(2);
 const getFlag = (name) => {
@@ -33,6 +36,7 @@ const boundingBox = bboxArg
   : undefined;
 const outPath = getFlag("--out");
 const date = getFlag("--date");
+const chartsDir = getFlag("--charts");
 
 const loadRecords = async () => {
   if (date) {
@@ -56,11 +60,35 @@ const loadRecords = async () => {
 };
 
 const records = await loadRecords();
-const report = formatEdaReport(computeEda(records));
+const eda = computeEda(records);
+let report = `${formatEdaReport(eda)}\n\n${formatQualityReport(auditQuality(records))}\n`;
+
+if (chartsDir) {
+  mkdirSync(chartsDir, { recursive: true });
+  const hourLabels = eda.recordsPerHour.map(([h]) => h.slice(11));
+  const hourValues = eda.recordsPerHour.map(([, c]) => c);
+  const files = {
+    "sog-histogram.svg": histogramSvg(records.map((r) => r.sog), {
+      title: "Speed over ground (knots)",
+      unit: "kn",
+    }),
+    "records-per-hour.svg": barChartSvg(hourLabels, hourValues, {
+      title: "Records per hour (UTC)",
+    }),
+    "track-map.svg": trackMapSvg(records, { title: "Vessel positions" }),
+  };
+  for (const [name, svg] of Object.entries(files)) {
+    writeFileSync(join(chartsDir, name), svg);
+  }
+  report += `\n## Charts\n${Object.keys(files)
+    .map((n) => `- ![${n}](${join(chartsDir, n)})`)
+    .join("\n")}\n`;
+  process.stderr.write(`Wrote ${Object.keys(files).length} SVG charts to ${chartsDir}/\n`);
+}
 
 if (outPath) {
-  writeFileSync(outPath, report + "\n");
+  writeFileSync(outPath, report);
   process.stderr.write(`Wrote ${outPath}\n`);
 } else {
-  process.stdout.write(report + "\n");
+  process.stdout.write(report);
 }
