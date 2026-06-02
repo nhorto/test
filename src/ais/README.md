@@ -1,53 +1,49 @@
 # AIS data integration
 
-Pulls vessel (AIS) data from two sources into a single record shape, then
-aggregates positions into per-vessel tracks.
+Pulls vessel (AIS) data into a single record shape, aggregates positions into
+per-vessel tracks, and runs exploratory data analysis.
 
 | Source | Kind | Backfills past? | Key needed | Status here |
 | --- | --- | --- | --- | --- |
-| **NOAA Marine Cadastre** | Historical archive (US, 2009→) | ✅ Yes | No | Parsing works offline; download needs `coast.noaa.gov` |
+| **Danish Maritime Authority (DMA)** | Historical archive (Danish/Baltic/North Sea, ~2006→) | ✅ Yes | No | Parsing works offline; download needs `web.ais.dk` |
 | **AISStream.io** | Live WebSocket stream | ❌ No (forward-only) | Yes | Needs `aisstream.io` + `AISSTREAM_API_KEY` |
 
-> **Why not AISHub / AISStream for history?** Both are *live* services — they
-> only report current/streaming positions and cannot return past data. For true
-> historical tracks use NOAA. AISStream is for *accumulating* history going
-> forward.
+> **Why DMA for history?** AISHub, AISStream and BarentsWatch are *live*
+> services — they report current/streaming positions only. The DMA open archive
+> publishes free daily zipped CSVs of past AIS, so it's the historical source.
 
 ## Network note (Claude Code on the web)
 
 Outbound access is governed by the environment's network policy. Under a closed
-policy, both `coast.noaa.gov` and `aisstream.io` return `host_not_allowed`. The
-pure parsing/aggregation code runs fully offline and is covered by tests; the
-`fetch*`/`collect*` functions are the network boundary and need an environment
-whose policy allowlists those hosts. See
+policy, `web.ais.dk` and `aisstream.io` are unreachable (`host_not_allowed` /
+DNS blocked). The parsing/aggregation/EDA code runs fully offline and is covered
+by tests; the `fetch*`/`collect*` functions are the network boundary and need an
+environment whose policy allowlists those hosts. See
 https://code.claude.com/docs/en/claude-code-on-the-web
 
-## Historical (NOAA)
+## Historical (DMA)
 
 ```js
-import { fetchHistoricalAis } from "./src/ais/index.mjs";
+import { fetchDmaAis } from "./src/ais/index.mjs";
 
-// One day of US AIS, filtered to New York harbor.
-const { records, tracks } = await fetchHistoricalAis("2023-01-01", {
-  boundingBox: { minLat: 40.4, maxLat: 40.9, minLon: -74.3, maxLon: -73.7 },
+// One day of Danish AIS, filtered to the Øresund / Copenhagen area.
+const { records, tracks } = await fetchDmaAis("2023-01-01", {
+  boundingBox: { minLat: 55.0, maxLat: 56.2, minLon: 12.0, maxLon: 13.0 },
 });
 ```
 
-Pre-2015 data is stored per UTM zone, so pass `{ zone }`:
-
-```js
-await fetchHistoricalAis("2012-06-15", { zone: 10 });
-```
+DMA daily files are large (often >1 GB uncompressed) — prefer a `boundingBox` /
+`timeRange`. Older years use monthly files: pass `{ granularity: "monthly" }`.
 
 Already have a downloaded zip/CSV? Skip the network entirely:
 
 ```js
 import { extractFirstCsv } from "./src/ais/unzip.mjs";
-import { parseAisCsv } from "./src/ais/parseAis.mjs";
+import { parseDmaCsv } from "./src/ais/parseDmaAis.mjs";
 import { buildTracks } from "./src/ais/tracks.mjs";
 
-const csv = extractFirstCsv(zipBuffer);      // or read a .csv directly
-const tracks = buildTracks(parseAisCsv(csv));
+const csv = extractFirstCsv(zipBuffer);   // or read a .csv directly
+const tracks = buildTracks(parseDmaCsv(csv));
 ```
 
 ## Live (AISStream)
@@ -62,11 +58,29 @@ export AISSTREAM_API_KEY="…"
 import { collectAisStream } from "./src/ais/index.mjs";
 
 const handle = collectAisStream({
-  boundingBoxes: [[[40.4, -74.3], [40.9, -73.7]]],
-  onRecord: (r) => save(r),   // same record shape as NOAA → feed buildTracks
-  onError: (e) => console.error(e),
+  boundingBoxes: [[[55.0, 12.0], [56.2, 13.0]]],
+  onRecord: (r) => save(r),   // same record shape as DMA → feed buildTracks
 });
 // later: handle.stop();
+```
+
+## Exploratory data analysis
+
+```bash
+# Local CSV or zip (offline):
+node scripts/ais-eda.mjs path/to/aisdk-2023-01-01.zip --bbox 55,56.2,12,13
+
+# Or fetch + analyze in one go (needs network):
+node scripts/ais-eda.mjs --date 2023-01-01 --bbox 55,56.2,12,13 --out report.md
+```
+
+Produces an overview (record/vessel counts, time range, bounding box), speed
+distribution, per-vessel activity and distances, ship-type / status / mobile-type
+breakdowns, field completeness, and an hourly histogram. Programmatic use:
+
+```js
+import { computeEda, formatEdaReport } from "./src/ais/eda.mjs";
+console.log(formatEdaReport(computeEda(records)));
 ```
 
 ## Tests
