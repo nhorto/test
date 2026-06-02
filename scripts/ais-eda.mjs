@@ -39,7 +39,8 @@ const outPath = getFlag("--out");
 const date = getFlag("--date");
 const chartsDir = getFlag("--charts");
 const flagCode = getFlag("--flag"); // e.g. RU  (focus a deep dive on one flag)
-const militaryOnly = args.includes("--military");
+// --scope interest|military|le|all ; --military is shorthand for --scope military
+const scope = getFlag("--scope") ?? (args.includes("--military") ? "military" : undefined);
 
 const loadRecords = async () => {
   if (date) {
@@ -66,11 +67,11 @@ const records = await loadRecords();
 const eda = computeEda(records);
 let report = `${formatEdaReport(eda)}\n\n${formatQualityReport(auditQuality(records))}\n`;
 
-// Optional focused deep dive (e.g. --flag RU --military).
-if (flagCode || militaryOnly) {
+// Optional focused deep dive (e.g. --flag RU --scope interest).
+if (flagCode || scope) {
   const focus = analyzeFocus(records, {
     flagCode: flagCode ?? null,
-    militaryOnly,
+    ...(scope ? { scope } : {}),
   });
   report += `\n${formatFocusReport(focus)}\n`;
 }

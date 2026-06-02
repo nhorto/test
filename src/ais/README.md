@@ -105,24 +105,33 @@ Built for monitoring Russian military/naval transits through the Danish Straits,
 but parameterised by flag and military filter.
 
 ```bash
-# Russian-flagged, military-classified, on a local file:
-node scripts/ais-eda.mjs aisdk-2023-01-01.zip --flag RU --military \
-  --bbox 54,58,9,14 --out report.md
+# Russian-flagged vessels of interest, on a local file:
+node scripts/ais-eda.mjs aisdk-2023-01-01.zip --flag RU --bbox 54,58,9,14 --out report.md
 ```
+
+**Scope** (`--scope`, default `interest`) decides which flagged vessels qualify:
+- `military` — AIS ship-type `35` / DMA "Military" only.
+- `le` — military + law enforcement / coast guard (type `55`, e.g. FSB Border Guard).
+- `interest` (default) — military **or** law enforcement **or** any behavioural
+  flag. Catches naval/intelligence vessels squawking as civilian without
+  dragging in all merchant traffic.
+- `all` — every flagged vessel.
 
 Identification (all from self-declared AIS — see caveats):
 - **Flag** = MMSI MID prefix (`getFlagInfo`); **Russia = MID 273**.
-- **Military** = AIS ship-type `35` / DMA "Military" text; **law enforcement** = `55`.
-  Optional `watchlist` of known MMSIs / name fragments via the API.
-- **"Going dark"** = reporting gaps ≥ threshold, flagged per vessel.
+- **Behavioural flags** (`behaviour.mjs`): `going_dark` (reporting gap ≥
+  `gapMinutes`), `loitering` (low-speed dwell while under way), `near_infrastructure`
+  (within `infraRadiusNm` of a supplied asset — cable/pipeline/wind-farm point),
+  `identity_change` (one MMSI broadcasting multiple names/types).
 
 ```js
 import { analyzeFocus, formatFocusReport } from "./src/ais/deepDive.mjs";
 const focus = analyzeFocus(records, {
   flagCode: "RU",
-  militaryOnly: true,
+  scope: "interest",
   gapMinutes: 30,
-  watchlist: { mmsi: ["273XXXXXX"], names: ["Admiral", "RFS"] },
+  loiterMinutes: 60,
+  infrastructure: [{ lat: 55.0, lon: 12.0, name: "Baltic Pipe" }],
 });
 console.log(formatFocusReport(focus));
 ```
